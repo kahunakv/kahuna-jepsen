@@ -11,6 +11,8 @@ MVCC and 2PC transactions.
 | `src/kahuna/client.clj` | REST client + the response-type → ok/fail/info mapping |
 | `src/kahuna/db.clj` | install / start / stop / kill / pause Kahuna on a node |
 | `src/kahuna/workload/register.clj` | linearizable CAS-register over the KV store |
+| `src/kahuna/workload/lock.clj` | mutual exclusion + fencing tokens over distributed locks |
+| `test/` | negative controls proving the lock checkers can actually fail |
 | `src/kahuna/core.clj` | test map, nemesis wiring, CLI |
 | `docker/` | 5 Jepsen nodes + a control node |
 | `scripts/build-tarball.sh` | self-contained `Kahuna.Server` publish → `target/kahuna.tar.gz` |
@@ -69,6 +71,27 @@ This suite does *not* by default, because a node that is SIGKILLed without an
 fsynced WAL may legitimately lose acknowledged writes, which would be a
 finding about the flag rather than about Kahuna. `--disable-wal-sync-writes`
 re-enables it when that is what you want to test.
+
+**Locks are leased, so naive mutual exclusion is not the property.**
+`LockActor` grants a lock until `now + expiresMs`; once that passes, another
+owner may take it even though the previous holder never released and may still
+believe it holds the lock. That is deliberate — it stops a crashed holder from
+wedging the resource forever. A checker that flagged every overlapping holder
+would report Kahuna's designed behaviour as a bug. So the lock workload checks
+the two properties that survive expiry:
+
+* **exclusion** — hold windows are trimmed to the earliest instant the lease
+  could have lapsed (and shrunk further by `--lease-margin-ms` to absorb
+  clock-rate differences), so an overlap it reports cannot be explained by
+  expiry.
+* **fencing** — tokens never go backwards and strictly increase when the lock
+  changes hands. Only genuinely ordered pairs are compared: if B was invoked
+  before A completed, the protocol promises nothing about their order.
+  Re-acquisition by the current holder returning the *same* token is expected
+  (`LockActor` returns `entry.FencingToken` unchanged) and is not a violation.
+
+Run `lein test` for the negative controls that prove those checkers reject
+real violations while accepting expiry-explained and concurrent ones.
 
 **Knossos memory is the practical limit, and it bites early.** Search cost is
 driven by per-key concurrency and by the number of *indeterminate* (`:info`)
@@ -131,10 +154,9 @@ latency plots, per-node server logs — uploads as an artifact on every run.
 
 Built:
 - [x] `register` — linearizable CAS register (Knossos)
+- [x] `lock` — mutual exclusion + fencing-token monotonicity, lease-aware
 
 Next, in rough order of value:
-- [ ] `lock` — mutual exclusion via `/v1/locks/try-lock`, including fencing
-      token monotonicity and lease-expiry behaviour under partition
 - [ ] `append` — Elle list-append over transaction sessions
       (`start-tx-session` → `try-set`/`try-get` → `commit-tx-session`), checking
       serializability / snapshot isolation of the 2PC+MVCC layer

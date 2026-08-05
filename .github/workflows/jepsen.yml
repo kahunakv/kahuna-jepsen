@@ -1,18 +1,14 @@
 name: jepsen
 
-# Manual dispatch only for now: the CI topology (privileged containers doing
-# iptables work, host->container SSH, a 10.0.x SDK) has not been exercised on a
-# GitHub runner yet. Once a few manual runs come back clean, add a nightly:
-#
-#   schedule:
-#     - cron: '0 4 * * *'
-#
-# This should NOT become a per-PR gate even then. Jepsen runs are
-# nondeterministic and a slow, contended runner manufactures indeterminate
+# Nightly + manual dispatch. This should NOT become a per-PR gate: Jepsen runs
+# are nondeterministic and a slow, contended runner manufactures indeterminate
 # operations that a fast machine would not — as a required check it would go
 # red for reasons unrelated to the change under review. A red run here means
 # "download the artifact and go look", not "the PR is broken".
 on:
+  schedule:
+    # 04:00 UTC nightly
+    - cron: '0 4 * * *'
   workflow_dispatch:
     inputs:
       kahuna_repo:
@@ -58,6 +54,16 @@ jobs:
             concurrency: 8
             concurrency_per_key: 2
             ops_per_key: 40
+          # The lock workload's checkers are linear-time, so it needs none of
+          # the register workload's search-cost tuning.
+          - workload: lock
+            faults: partition
+            concurrency: 10
+            ops_per_key: 60
+          - workload: lock
+            faults: partition,kill
+            concurrency: 10
+            ops_per_key: 60
 
     env:
       KAHUNA_REPO: ${{ inputs.kahuna_repo || 'kahunakv/kahuna' }}
@@ -171,7 +177,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v5
         with:
-          name: jepsen-${{ matrix.workload }}-${{ strategy.job-index }}
+          name: jepsen-${{ matrix.workload }}-${{ strategy.job-index }}-${{ github.run_attempt }}
           path: store/
           retention-days: 14
           if-no-files-found: warn

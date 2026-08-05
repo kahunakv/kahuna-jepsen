@@ -11,10 +11,12 @@
             [jepsen.os.debian :as debian]
             [kahuna.client :as kc]
             [kahuna.db :as kdb]
+            [kahuna.workload.lock :as lock]
             [kahuna.workload.register :as register]))
 
 (def workloads
-  {:register register/workload})
+  {:register register/workload
+   :lock     lock/workload})
 
 (def all-faults
   "Clock faults are NOT in the default set on purpose: settimeofday inside a
@@ -102,6 +104,20 @@
 
    [nil "--disable-wal-sync-writes" "Run Kahuna without WAL fsync (expect data loss on kill)"
     :default false]
+
+   [nil "--lock-expires-ms MS" "Lock lease length (lock workload). Long enough
+                               that a healthy holder keeps the lock, short
+                               enough that a killed one frees it."
+    :default 10000
+    :parse-fn read-string
+    :validate [pos? "must be positive"]]
+
+   [nil "--lease-margin-ms MS" "Slack subtracted from hold windows to absorb
+                               clock-rate differences between the control node
+                               and the servers."
+    :default 500
+    :parse-fn read-string
+    :validate [(complement neg?) "must be non-negative"]]
 
    [nil "--linearizable-algorithm NAME" "Knossos search: wgl (lower memory,
                                         default) or linear."
