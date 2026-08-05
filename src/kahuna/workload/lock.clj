@@ -69,8 +69,13 @@
           :acquire
           (let [r (kc/try-lock! node resource owner expires-ms opts)]
             (case (:type r)
+              ;; :node is diagnostic, not part of any checked property — when a
+              ;; fencing token regresses, the first question is which node
+              ;; served the stale value.
               :locked (assoc op :type :ok
-                                :value {:owner owner :token (:fencing-token r)})
+                                :value {:owner owner
+                                        :token (:fencing-token r)
+                                        :node  node})
               :busy   (assoc op :type :fail :error :busy)
               (assoc op :type (kc/response-class (:type r)) :error (:type r))))
 
@@ -216,6 +221,7 @@
                                   [(dissoc invokes t)
                                    (conj acc {:owner  (get-in op [:value :owner])
                                               :token  (get-in op [:value :token])
+                                              :node   (get-in op [:value :node])
                                               :time   (:time op)
                                               :invoke (get invokes t (:time op))})]
 

@@ -1,5 +1,7 @@
 # kahuna-jepsen
 
+[![jepsen](https://github.com/kahunakv/kahuna-jepsen/actions/workflows/jepsen.yml/badge.svg)](https://github.com/kahunakv/kahuna-jepsen/actions/workflows/jepsen.yml)
+
 Jepsen tests for [Kahuna](https://github.com/kahunakv/kahuna) — a distributed
 lock manager, key/value store and sequencer built on Raft (Kommander) with
 MVCC and 2PC transactions.
@@ -12,6 +14,7 @@ MVCC and 2PC transactions.
 | `src/kahuna/db.clj` | install / start / stop / kill / pause Kahuna on a node |
 | `src/kahuna/workload/register.clj` | linearizable CAS-register over the KV store |
 | `src/kahuna/workload/lock.clj` | mutual exclusion + fencing tokens over distributed locks |
+| `src/kahuna/workload/append.clj` | Elle list-append over interactive transactions |
 | `test/` | negative controls proving the lock checkers can actually fail |
 | `src/kahuna/core.clj` | test map, nemesis wiring, CLI |
 | `docker/` | 5 Jepsen nodes + a control node |
@@ -93,6 +96,24 @@ the two properties that survive expiry:
 Run `lein test` for the negative controls that prove those checkers reject
 real violations while accepting expiry-explained and concurrent ones.
 
+**The append workload needs ≥2 CPUs, and fails fast without them.**
+`elle.core/combine` launches `jepsen.history.task`s that await other tasks, and
+that executor is sized from `availableProcessors`. With one worker a task
+blocks forever on a subtask that can never be scheduled: the run reaches
+`Analyzing...` and sits at 0% CPU indefinitely, which reads as a slow check
+rather than a deadlock. Docker Desktop will happily hand its VM a single CPU on
+an 8-core host (`docker info` → `NCPU`); raise it under Settings → Resources.
+`kahuna.workload.append/check-cpus!` refuses to start rather than let you
+discover this after a full run has already been collected.
+
+Transactions are driven with `TrackAndValidate` read validation and pessimistic
+locking — the combination Kahuna's docs credit for serializable behaviour — so
+`--consistency-model` defaults to `serializable`. Pass `snapshot-isolation` to
+check the weaker claim, or `--locking optimistic` to exercise the other path.
+Kahuna has no native list-append, so an append is a read-modify-write inside
+the session; the read half is deliberate, since it puts the key in the
+transaction's read set.
+
 **Knossos memory is the practical limit, and it bites early.** Search cost is
 driven by per-key concurrency and by the number of *indeterminate* (`:info`)
 operations — not by wall-clock time. Observed on a 4 GB Docker VM:
@@ -119,15 +140,11 @@ disposable Linux host, not on your laptop.
 
 ## Continuous integration
 
-`.github/workflows/jepsen.yml` runs the suite as a matrix over fault sets
-(`partition`, `kill`, `partition,kill`).
+`.github/workflows/jepsen.yml` runs nightly (04:00 UTC) and on manual dispatch,
+as a matrix over workloads and fault sets — `register` under `partition`,
+`kill`, and `partition,kill`; `lock` under `partition` and `partition,kill`.
 
-It is currently **manual dispatch only** — the CI topology has not yet been
-exercised on a real GitHub runner. Once a few manual runs come back clean,
-uncomment the `schedule:` block at the top of the workflow to add a nightly.
-
-It should not become a per-PR gate even then. Jepsen results are
-nondeterministic,
+It should not become a per-PR gate. Jepsen results are nondeterministic,
 and a slow, contended runner manufactures indeterminate operations a fast
 machine would never produce. As a required check it would go red for reasons
 unrelated to the change under review, and a check people learn to ignore is
@@ -139,7 +156,7 @@ Differences from a local run:
 * **Topology.** On a Linux runner the host reaches container IPs directly, so
   CI starts only `n1..n5` and runs Jepsen on the runner itself — no control
   container, no bind mount.
-* **Heap.** `lein with-profile +ci` raises `-Xmx` to 8g, which a 16 GB runner
+* **Heap.** `lein with-profile +ci` raises `-Xmx` to 11g, which a 16 GB runner
   supports and a 4 GB Docker Desktop VM does not.
 * **Architecture.** The tarball is built for `linux-x64`, not `linux-arm64`.
 * **Rate.** Defaults to 10 req/s: four vCPUs hosting five .NET servers plus the
@@ -157,7 +174,9 @@ Built:
 - [x] `lock` — mutual exclusion + fencing-token monotonicity, lease-aware
 
 Next, in rough order of value:
-- [ ] `append` — Elle list-append over transaction sessions
+- [ ] `append` — written and wired into CI, but **not yet validated against a
+      real cluster**: the only local attempt deadlocked in Elle on a 1-CPU
+      Docker VM before producing a verdict
       (`start-tx-session` → `try-set`/`try-get` → `commit-tx-session`), checking
       serializability / snapshot isolation of the 2PC+MVCC layer
 - [ ] `sequencer` — no duplicate or lost ids from `/v1/sequences/next` and

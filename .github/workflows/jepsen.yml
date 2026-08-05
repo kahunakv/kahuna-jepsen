@@ -64,6 +64,16 @@ jobs:
             faults: partition,kill
             concurrency: 10
             ops_per_key: 60
+          # Elle needs >=2 CPUs or its analysis deadlocks; ubuntu-latest has 4.
+          # Transactions are slower than single-key ops, so run fewer clients.
+          - workload: append
+            faults: partition
+            concurrency: 5
+            ops_per_key: 60
+          - workload: append
+            faults: partition,kill
+            concurrency: 5
+            ops_per_key: 60
 
     env:
       KAHUNA_REPO: ${{ inputs.kahuna_repo || 'kahunakv/kahuna' }}

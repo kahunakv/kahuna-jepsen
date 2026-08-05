@@ -11,12 +11,14 @@
             [jepsen.os.debian :as debian]
             [kahuna.client :as kc]
             [kahuna.db :as kdb]
+            [kahuna.workload.append :as append]
             [kahuna.workload.lock :as lock]
             [kahuna.workload.register :as register]))
 
 (def workloads
   {:register register/workload
-   :lock     lock/workload})
+   :lock     lock/workload
+   :append   append/workload})
 
 (def all-faults
   "Clock faults are NOT in the default set on purpose: settimeofday inside a
@@ -104,6 +106,26 @@
 
    [nil "--disable-wal-sync-writes" "Run Kahuna without WAL fsync (expect data loss on kill)"
     :default false]
+
+   [nil "--consistency-model NAME" "Elle model to demand of the append
+                                   workload: serializable (default),
+                                   snapshot-isolation, strict-serializable, …"
+    :default :serializable
+    :parse-fn keyword]
+
+   [nil "--locking NAME" "Transaction locking for the append workload:
+                         pessimistic (default) or optimistic."
+    :default :pessimistic
+    :parse-fn keyword
+    :validate [#{:pessimistic :optimistic} "must be pessimistic or optimistic"]]
+
+   [nil "--key-count COUNT" "Keys in play at once (append workload)"
+    :default 5
+    :parse-fn read-string]
+
+   [nil "--max-txn-length COUNT" "Micro-ops per transaction (append workload)"
+    :default 4
+    :parse-fn read-string]
 
    [nil "--lock-expires-ms MS" "Lock lease length (lock workload). Long enough
                                that a healthy holder keeps the lock, short
