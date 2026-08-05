@@ -23,6 +23,11 @@
   ;; CI runners (16 GB) have far more headroom than a Docker Desktop VM, so the
   ;; analysis can afford a real heap. Used by .github/workflows/jepsen.yml via
   ;; `lein with-profile +ci run test ...`.
-  :profiles {:ci {:jvm-opts ["-Djava.awt.headless=true" "-server" "-Xmx8g"]}}
+  ;;
+  ;; 8g was not enough: independent keys are analyzed *concurrently* by an
+  ;; agent pool, so several Knossos searches compete for the heap at once. A
+  ;; 180s run at --ops-per-key 100 still OOM'd on 2 of 18 keys. The workflow
+  ;; also drops to --ops-per-key 60; both knobs matter.
+  :profiles {:ci {:jvm-opts ["-Djava.awt.headless=true" "-server" "-Xmx11g"]}}
 
   :repl-options {:init-ns kahuna.core})

@@ -88,6 +88,12 @@ jobs:
           key: nuget-${{ hashFiles('kahuna/**/*.csproj') }}
           restore-keys: nuget-
 
+      - name: Install plotting tools
+        # jepsen.checker/perf shells out to gnuplot; without it the perf
+        # checker returns :valid? :unknown and drags the whole run's verdict
+        # down with it. graphviz is used by the timeline/graph renderers.
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq gnuplot graphviz
+
       - name: Install Leiningen
         run: |
           sudo curl -fsSL -o /usr/local/bin/lein \
@@ -138,7 +144,7 @@ jobs:
             --time-limit "$TIME_LIMIT" \
             --rate "$RATE" \
             --concurrency 9 \
-            --ops-per-key 100 \
+            --ops-per-key 60 \
             --tarball target/kahuna.tar.gz
 
       - name: Collect server logs
