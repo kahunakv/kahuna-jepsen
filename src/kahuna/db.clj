@@ -83,11 +83,35 @@
       binary
       (start-args test node))))
 
+(def process-pattern
+  "pgrep -f pattern matching the server process — and deliberately NOT matching
+  the kill pipeline that carries it.
+
+  `grepkill!` expands to `pgrep -f <pattern> | xargs kill -SIG`, so the
+  pipeline's own command line contains the pattern verbatim. With a plain
+  \"Kahuna.Server\" the pipeline matches itself: `kill -kill` SIGKILLs its own
+  xargs and exits 137 (which crashed a CI run after the history was complete
+  but before analysis), and `kill -stop` would SIGSTOP the pipeline and hang.
+
+  The bracket makes the two strings differ while matching the same process:
+  the regex `Kahuna[.]Server` matches the real process's `Kahuna.Server`, but
+  the literal text `Kahuna[.]Server` in the pipeline's own command line does
+  not match it."
+  "Kahuna[.]Server")
+
+(defn kill-stragglers!
+  "SIGKILLs any Kahuna.Server left running. Tolerates failure: the nemesis
+  cheerfully kills a node that is already dead, and that must never abort a
+  test that has a complete history waiting to be analyzed."
+  []
+  (try+
+    (c/su (cu/grepkill! :kill process-pattern))
+    (catch Object _ nil)))
+
 (defn stop!
   [test node]
-  (c/su
-    (cu/stop-daemon! binary pidfile)
-    (cu/grepkill! :kill "Kahuna.Server")))
+  (c/su (cu/stop-daemon! binary pidfile))
+  (kill-stragglers!))
 
 (defn up?
   "Is this node answering API requests? Checks the status explicitly: the client
@@ -141,15 +165,17 @@
       :started)
 
     (kill! [this test node]
-      (c/su (cu/grepkill! :kill "Kahuna.Server"))
+      ;; Same self-kill hazard as stop!: the nemesis happily kills a node it
+      ;; already killed, and that must not crash the test.
+      (kill-stragglers!)
       :killed)
 
     ;; Required by jepsen.nemesis.combined's :pause fault
     db/Pause
     (pause! [this test node]
-      (c/su (cu/grepkill! :stop "Kahuna.Server"))
+      (c/su (cu/grepkill! :stop process-pattern))
       :paused)
 
     (resume! [this test node]
-      (c/su (cu/grepkill! :cont "Kahuna.Server"))
+      (c/su (cu/grepkill! :cont process-pattern))
       :resumed)))
