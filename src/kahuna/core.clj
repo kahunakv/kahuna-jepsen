@@ -103,6 +103,12 @@
    [nil "--disable-wal-sync-writes" "Run Kahuna without WAL fsync (expect data loss on kill)"
     :default false]
 
+   [nil "--linearizable-algorithm NAME" "Knossos search: wgl (lower memory,
+                                        default) or linear."
+    :default :wgl
+    :parse-fn keyword
+    :validate [#{:wgl :linear} "must be wgl or linear"]]
+
    [nil "--concurrency-per-key COUNT" "Processes hammering one register at once.
                                       Drives Knossos's search cost hardest.
                                       MUST divide --concurrency evenly, or

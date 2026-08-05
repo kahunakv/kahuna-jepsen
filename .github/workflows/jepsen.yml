@@ -40,13 +40,24 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
+        # Combined faults leave far more operations indeterminate (~27% :info
+        # vs ~5% for a single fault), and indeterminate ops are what makes
+        # Knossos's search explode. That job therefore runs a deliberately
+        # cheaper-to-check history: fewer processes per key, fewer ops per key.
         include:
           - workload: register
             faults: partition
+            concurrency: 9
+            ops_per_key: 60
           - workload: register
             faults: kill
+            concurrency: 9
+            ops_per_key: 60
           - workload: register
             faults: partition,kill
+            concurrency: 8
+            concurrency_per_key: 2
+            ops_per_key: 40
 
     env:
       KAHUNA_REPO: ${{ inputs.kahuna_repo || 'kahunakv/kahuna' }}
@@ -143,8 +154,9 @@ jobs:
             --nodes n1,n2,n3,n4,n5 \
             --time-limit "$TIME_LIMIT" \
             --rate "$RATE" \
-            --concurrency 9 \
-            --ops-per-key 60 \
+            --concurrency ${{ matrix.concurrency }} \
+            --concurrency-per-key ${{ matrix.concurrency_per_key || 3 }} \
+            --ops-per-key ${{ matrix.ops_per_key }} \
             --tarball target/kahuna.tar.gz
 
       - name: Collect server logs

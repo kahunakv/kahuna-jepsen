@@ -100,9 +100,13 @@
     {:client    (RegisterClient. nil durability)
      :checker   (independent/checker
                   (checker/compose
+                    ;; :wgl (Wing-Gong with Lowe's optimizations) uses far less
+                    ;; memory than :linear on histories with many indeterminate
+                    ;; ops — and combined partition+kill runs are ~27% :info,
+                    ;; which OOM'd :linear even at -Xmx11g.
                     {:linear   (checker/linearizable
                                  {:model     (model/cas-register)
-                                  :algorithm :linear})
+                                  :algorithm (:linearizable-algorithm opts :wgl)})
                      :timeline (timeline/html)}))
      ;; Per-key concurrency is the dominant term in Knossos's search cost — it
      ;; is roughly exponential in the number of processes concurrently touching
