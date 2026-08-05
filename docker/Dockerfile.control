@@ -1,0 +1,32 @@
+# The Jepsen control node: runs lein, SSHes into n1..n5, renders results.
+FROM clojure:temurin-21-lein-bookworm
+
+RUN apt-get -qy update && \
+    apt-get -qy install \
+      openssh-client \
+      sshpass \
+      git \
+      gnuplot \
+      graphviz \
+      iputils-ping \
+      curl && \
+    apt-get -qy clean && \
+    rm -rf /var/lib/apt/lists/*
+
+# Nodes are throwaway containers whose host keys change on every rebuild.
+RUN printf 'Host *\n  StrictHostKeyChecking no\n  UserKnownHostsFile /dev/null\n  LogLevel ERROR\n' \
+      > /etc/ssh/ssh_config.d/jepsen.conf || \
+    printf 'Host *\n  StrictHostKeyChecking no\n  UserKnownHostsFile /dev/null\n  LogLevel ERROR\n' \
+      >> /etc/ssh/ssh_config
+
+# The private key is mounted read-only by compose; ssh refuses group/other
+# readable keys, so copy it into place with tight permissions at start-up.
+COPY --chmod=755 entrypoint-control.sh /usr/local/bin/entrypoint-control.sh
+ENTRYPOINT ["/usr/local/bin/entrypoint-control.sh"]
+
+WORKDIR /jepsen
+
+# Results are served at http://localhost:8080 via `lein run serve`.
+EXPOSE 8080
+
+CMD ["bash"]

@@ -1,0 +1,43 @@
+# A Jepsen node: Debian with sshd, plus everything the nemesis needs to break
+# the machine (iptables for partitions, build-essential because jepsen compiles
+# its clock-skew helper on the node) and everything a self-contained .NET
+# publish needs to run (libicu, libssl).
+FROM debian:bookworm-slim
+
+RUN apt-get -qy update && \
+    apt-get -qy install \
+      openssh-server \
+      sudo \
+      iptables \
+      iproute2 \
+      procps \
+      psmisc \
+      build-essential \
+      curl \
+      ca-certificates \
+      libicu72 \
+      libssl3 \
+      zlib1g \
+      tar \
+      gzip \
+      ntpsec-ntpdate && \
+    apt-get -qy clean && \
+    rm -rf /var/lib/apt/lists/*
+
+# Jepsen drives nodes as root over SSH. Key auth is not optional: jepsen's file
+# upload path shells out to `scp`, which cannot use a password, so a
+# password-only node fails at DB install time.
+#
+# docker/up.sh generates the key pair into docker/secret/ before building.
+COPY secret/id_ed25519.pub /root/.ssh/authorized_keys
+
+RUN chmod 700 /root/.ssh && chmod 600 /root/.ssh/authorized_keys && \
+    sed -ri 's/^#?PermitRootLogin.*/PermitRootLogin prohibit-password/' /etc/ssh/sshd_config && \
+    sed -ri 's/^#?PasswordAuthentication.*/PasswordAuthentication no/' /etc/ssh/sshd_config && \
+    sed -ri 's/^#?UseDNS.*/UseDNS no/' /etc/ssh/sshd_config
+
+EXPOSE 22 8081 8082
+
+# /run/sshd must exist at *runtime* (sshd's privilege-separation dir), so
+# recreate it here rather than relying on the build-time mkdir surviving.
+CMD ["sh", "-c", "mkdir -p /run/sshd && exec /usr/sbin/sshd -D -e"]

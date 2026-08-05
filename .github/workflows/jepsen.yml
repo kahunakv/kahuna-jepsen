@@ -1,0 +1,163 @@
+name: jepsen
+
+# Manual dispatch only for now: the CI topology (privileged containers doing
+# iptables work, host->container SSH, a 10.0.x SDK) has not been exercised on a
+# GitHub runner yet. Once a few manual runs come back clean, add a nightly:
+#
+#   schedule:
+#     - cron: '0 4 * * *'
+#
+# This should NOT become a per-PR gate even then. Jepsen runs are
+# nondeterministic and a slow, contended runner manufactures indeterminate
+# operations that a fast machine would not — as a required check it would go
+# red for reasons unrelated to the change under review. A red run here means
+# "download the artifact and go look", not "the PR is broken".
+on:
+  workflow_dispatch:
+    inputs:
+      kahuna_repo:
+        description: 'Kahuna server repository'
+        default: 'kahunakv/kahuna'
+      kahuna_ref:
+        description: 'Kahuna git ref to test'
+        default: 'main'
+      time_limit:
+        description: 'Seconds of load per test'
+        default: '180'
+      rate:
+        description: 'Requests/sec per client'
+        default: '10'
+
+concurrency:
+  group: jepsen-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - workload: register
+            faults: partition
+          - workload: register
+            faults: kill
+          - workload: register
+            faults: partition,kill
+
+    env:
+      KAHUNA_REPO: ${{ inputs.kahuna_repo || 'kahunakv/kahuna' }}
+      KAHUNA_REF:  ${{ inputs.kahuna_ref  || 'main' }}
+      TIME_LIMIT:  ${{ inputs.time_limit  || '180' }}
+      RATE:        ${{ inputs.rate        || '10' }}
+
+    steps:
+      - name: Check out test suite
+        uses: actions/checkout@v4
+
+      - name: Check out Kahuna server
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.KAHUNA_REPO }}
+          ref: ${{ env.KAHUNA_REF }}
+          path: kahuna
+
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '10.0.x'
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+
+      - name: Cache Maven deps
+        uses: actions/cache@v4
+        with:
+          path: ~/.m2
+          key: m2-${{ hashFiles('project.clj') }}
+          restore-keys: m2-
+
+      - name: Cache NuGet packages
+        uses: actions/cache@v4
+        with:
+          path: ~/.nuget/packages
+          key: nuget-${{ hashFiles('kahuna/**/*.csproj') }}
+          restore-keys: nuget-
+
+      - name: Install Leiningen
+        run: |
+          sudo curl -fsSL -o /usr/local/bin/lein \
+            https://raw.githubusercontent.com/technomancy/leiningen/stable/bin/lein
+          sudo chmod +x /usr/local/bin/lein
+          lein version
+
+      - name: Build Kahuna tarball
+        # linux-x64: must match the runner/container architecture, NOT a dev
+        # laptop's arm64.
+        run: ./scripts/build-tarball.sh "$GITHUB_WORKSPACE/kahuna" linux-x64
+
+      - name: Generate SSH key for the nodes
+        run: |
+          mkdir -p docker/secret
+          ssh-keygen -t ed25519 -N "" -C jepsen -f docker/secret/id_ed25519
+          mkdir -p ~/.ssh
+          cp docker/secret/id_ed25519 ~/.ssh/id_ed25519
+          chmod 700 ~/.ssh && chmod 600 ~/.ssh/id_ed25519
+          printf 'Host *\n  StrictHostKeyChecking no\n  UserKnownHostsFile /dev/null\n  LogLevel ERROR\n' \
+            >> ~/.ssh/config
+
+      - name: Start Kahuna nodes
+        # Only n1..n5 — on a Linux runner the host reaches container IPs
+        # directly, so Jepsen runs on the runner itself and the control
+        # container is unnecessary.
+        run: docker compose -f docker/compose.yml up -d --build n1 n2 n3 n4 n5
+
+      - name: Map node names to container IPs
+        run: |
+          for n in n1 n2 n3 n4 n5; do
+            ip="$(docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' "jepsen-$n")"
+            echo "$ip $n" | sudo tee -a /etc/hosts
+          done
+          for n in n1 n2 n3 n4 n5; do
+            until ssh -o ConnectTimeout=2 root@"$n" true 2>/dev/null; do sleep 1; done
+            echo "$n reachable"
+          done
+
+      - name: Run ${{ matrix.workload }} / ${{ matrix.faults }}
+        # jepsen.cli exits non-zero when the checker returns :valid? false, so
+        # no result parsing is needed here.
+        run: |
+          lein with-profile +ci run test \
+            --workload ${{ matrix.workload }} \
+            --faults ${{ matrix.faults }} \
+            --nodes n1,n2,n3,n4,n5 \
+            --time-limit "$TIME_LIMIT" \
+            --rate "$RATE" \
+            --concurrency 10 \
+            --ops-per-key 100 \
+            --tarball target/kahuna.tar.gz
+
+      - name: Collect server logs
+        if: always()
+        run: |
+          mkdir -p store/docker-logs
+          for n in n1 n2 n3 n4 n5; do
+            docker logs "jepsen-$n" > "store/docker-logs/$n.docker.log" 2>&1 || true
+          done
+
+      - name: Upload Jepsen store
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: jepsen-${{ matrix.workload }}-${{ strategy.job-index }}
+          path: store/
+          retention-days: 14
+          if-no-files-found: warn
+
+      - name: Tear down
+        if: always()
+        run: docker compose -f docker/compose.yml down -v || true

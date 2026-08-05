@@ -1,0 +1,22 @@
+# Overlay that grants nodes SYS_TIME so jepsen's clock nemesis can skew and
+# strobe the clock. Kahuna's MVCC snapshots and lock leases ride on a hybrid
+# logical clock, so this is where the most interesting bugs should live.
+#
+# DANGER: containers share the host kernel's clock. Using this moves the clock
+# of the *host* (or the Docker Desktop VM). Run it only on a disposable Linux
+# machine — never on your laptop, never in CI.
+#
+#   docker compose -f compose.yml -f compose.clock.yml up -d
+#   lein run test --faults partition,clock ...
+
+x-clock: &clock
+  cap_add:
+    - NET_ADMIN
+    - SYS_TIME
+
+services:
+  n1: {<<: *clock}
+  n2: {<<: *clock}
+  n3: {<<: *clock}
+  n4: {<<: *clock}
+  n5: {<<: *clock}

@@ -1,0 +1,66 @@
+name: kahuna-jepsen
+
+# Five Kahuna nodes plus a control node, all on one bridge network so the
+# control node can resolve n1..n5 by name. Nodes are privileged because the
+# nemesis manipulates iptables (partitions) and, optionally, the clock.
+
+x-node: &node
+  build:
+    context: .
+    dockerfile: Dockerfile.node
+  privileged: true
+  # SYS_TIME is deliberately absent: a container that can call settimeofday
+  # moves the *host's* clock, which on a CI runner breaks TLS validation and
+  # the job agent itself. Add it via docker/compose.clock.yml only on a
+  # disposable Linux box where you actually want clock faults.
+  cap_add:
+    - NET_ADMIN
+  networks:
+    - jepsen
+
+services:
+  control:
+    build:
+      context: .
+      dockerfile: Dockerfile.control
+    container_name: jepsen-control
+    hostname: control
+    stdin_open: true
+    tty: true
+    volumes:
+      - ..:/jepsen
+      - ./secret:/secret:ro
+    ports:
+      - "8080:8080"
+    networks:
+      - jepsen
+    depends_on: [n1, n2, n3, n4, n5]
+
+  n1:
+    <<: *node
+    container_name: jepsen-n1
+    hostname: n1
+
+  n2:
+    <<: *node
+    container_name: jepsen-n2
+    hostname: n2
+
+  n3:
+    <<: *node
+    container_name: jepsen-n3
+    hostname: n3
+
+  n4:
+    <<: *node
+    container_name: jepsen-n4
+    hostname: n4
+
+  n5:
+    <<: *node
+    container_name: jepsen-n5
+    hostname: n5
+
+networks:
+  jepsen:
+    driver: bridge
