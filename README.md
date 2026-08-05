@@ -80,6 +80,10 @@ operations — not by wall-clock time. Observed on a 4 GB Docker VM:
 | rate 20, 5 procs/key, 100 ops/key | JVM OOM-killed by the kernel (`-Xmx` exceeded VM RAM — no stack trace, looks like a hang) |
 | rate 15, 3 procs/key, 60 ops/key | analyzed cleanly, `:valid? true` |
 
+`--concurrency` must be an exact multiple of `--concurrency-per-key`;
+`jepsen.independent` asserts at start-up otherwise (e.g. 10 threads cannot run
+3 keys × 3 threads).
+
 So: turn `--concurrency-per-key` down before anything else, keep `-Xmx` below
 the VM's actual RAM, and prefer a longer run at lower density over a dense one
 that cannot be checked. An unanalyzable history proves nothing.

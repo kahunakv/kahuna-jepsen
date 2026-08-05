@@ -137,7 +137,7 @@ jobs:
             --nodes n1,n2,n3,n4,n5 \
             --time-limit "$TIME_LIMIT" \
             --rate "$RATE" \
-            --concurrency 10 \
+            --concurrency 9 \
             --ops-per-key 100 \
             --tarball target/kahuna.tar.gz
 

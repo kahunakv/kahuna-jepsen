@@ -104,7 +104,9 @@
     :default false]
 
    [nil "--concurrency-per-key COUNT" "Processes hammering one register at once.
-                                      Drives Knossos's search cost hardest."
+                                      Drives Knossos's search cost hardest.
+                                      MUST divide --concurrency evenly, or
+                                      jepsen.independent asserts at start-up."
     :default 3
     :parse-fn read-string]
 
