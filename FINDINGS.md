@@ -1,5 +1,6 @@
 # Findings and status
 
+For *why* the tests are shaped the way they are, see [DESIGN.md](DESIGN.md).
 
 ## Workload status
 
