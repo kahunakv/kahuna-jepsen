@@ -6,19 +6,26 @@ Jepsen tests for [Kahuna](https://github.com/kahunakv/kahuna) — a distributed
 lock manager, key/value store and sequencer built on Raft (Kommander) with
 MVCC and 2PC transactions.
 
-## What's here
+Three workloads run against a 5-node cluster while a nemesis partitions,
+kills and pauses nodes:
 
-| Path | Purpose |
+| Workload | What it checks |
 |---|---|
-| `src/kahuna/client.clj` | REST client + the response-type → ok/fail/info mapping |
-| `src/kahuna/db.clj` | install / start / stop / kill / pause Kahuna on a node |
-| `src/kahuna/workload/register.clj` | linearizable CAS-register over the KV store |
-| `src/kahuna/workload/lock.clj` | mutual exclusion + fencing tokens over distributed locks |
-| `src/kahuna/workload/append.clj` | Elle list-append over interactive transactions |
-| `test/` | negative controls proving the lock checkers can actually fail |
-| `src/kahuna/core.clj` | test map, nemesis wiring, CLI |
-| `docker/` | 5 Jepsen nodes + a control node |
-| `scripts/build-tarball.sh` | self-contained `Kahuna.Server` publish → `target/kahuna.tar.gz` |
+| `register` | linearizability of a CAS register over the KV store (Knossos) |
+| `lock` | mutual exclusion + fencing-token monotonicity, lease-aware |
+| `append` | serializability of interactive transactions (Elle list-append) |
+
+- **[DESIGN.md](DESIGN.md)** — why the tests are shaped this way, and the limits
+  you will hit. Read it before trusting or dismissing a red result.
+- **[FINDINGS.md](FINDINGS.md)** — what the tests have found, and what is still
+  unwritten.
+
+## Requirements
+
+- Docker with **≥2 CPUs** allocated to its VM — Elle's analysis deadlocks below
+  that (`docker info` → `NCPU`; Docker Desktop → Settings → Resources)
+- .NET 10 SDK, to build the Kahuna server tarball
+- Leiningen and a JDK
 
 ## Running
 
@@ -31,8 +38,6 @@ scripts/build-tarball.sh ~/kahuna linux-arm64
 docker/up.sh
 
 # 3. From the control node shell:
-# This exact invocation has been run green end-to-end (15 keys, all
-# linearizable, under random-halves/majorities-ring partitions).
 lein run test --workload register \
               --nodes n1,n2,n3,n4,n5 \
               --time-limit 60 \
@@ -45,111 +50,61 @@ lein run test --workload register \
 lein run serve   # http://localhost:8080
 ```
 
+`lein run test --help` lists every option. The ones you are most likely to
+reach for:
+
+| Flag | Meaning |
+|---|---|
+| `--workload` | `register`, `lock` or `append` |
+| `--faults` | comma-separated `partition,kill,pause,clock`, or `all` |
+| `--concurrency` | total client threads; **must** be an exact multiple of `--concurrency-per-key` |
+| `--rate` | requests/sec per client |
+| `--time-limit` | seconds of load |
+| `--ephemeral` | use `Ephemeral` durability instead of `Persistent` |
+
+Run `lein test` for the unit tests — negative controls proving the lock
+checkers actually reject real violations.
+
 `docker/up.sh` generates an SSH key pair into `docker/secret/` (gitignored) and
 bakes the public half into the node images. Key auth is mandatory rather than
 cosmetic: Jepsen uploads the server tarball by shelling out to `scp`, which
 cannot use a password.
 
-## Design notes
+## Reading a result
 
-**Client transport.** Tests speak plain HTTP on port 8081. Kahuna serves HTTPS
-and Raft together on 8082, so using cleartext for clients keeps TLS handshake
-noise out of the failure signal — and means a network partition of 8082 hits
-replication without also killing the client connection.
+A run ends with a verdict map and either `Everything looks good!` or
+`Analysis invalid!`. Two verdicts mean less than they appear to:
 
-**Error classification is the whole ballgame.** `kahuna.client/response-class`
-decides whether a write outcome is definite or unknown. `MustRetry`,
-`WaitingForReplication`, `Aborted`, `Errored`, and any socket timeout are
-mapped to `:info` (indeterminate). Getting this wrong in either direction
-invalidates the linearizability analysis: `:fail` on an operation that later
-commits produces phantom violations, and `:ok` on one that never commits hides
-real ones. Before trusting a red result, re-read this mapping.
+- `:valid? :unknown` — the checker could not finish, usually out of memory. It
+  is not a pass. See [DESIGN.md](DESIGN.md#knossos-memory-is-the-practical-limit-and-it-bites-early).
+- `:empty-transaction-graph` (append) — **nothing committed**, so there was
+  nothing to analyze. Check the client's failure tally and the node logs before
+  reading it as anything else; see [FINDINGS.md](FINDINGS.md).
 
-**Durability.** Runs default to `Persistent`. `--ephemeral` switches to
-`Ephemeral`, which should *not* be expected to survive kills — run it as a
-separate, weaker-expectation test rather than mixing the two.
+Everything from a run lands in `store/<test>/<timestamp>/` — history, verdict,
+timeline HTML, latency plots and per-node server logs.
 
-**WAL fsync.** Kahuna's own docker compose passes `--disable-wal-sync-writes`.
-This suite does *not* by default, because a node that is SIGKILLed without an
-fsynced WAL may legitimately lose acknowledged writes, which would be a
-finding about the flag rather than about Kahuna. `--disable-wal-sync-writes`
-re-enables it when that is what you want to test.
+## What's here
 
-**Locks are leased, so naive mutual exclusion is not the property.**
-`LockActor` grants a lock until `now + expiresMs`; once that passes, another
-owner may take it even though the previous holder never released and may still
-believe it holds the lock. That is deliberate — it stops a crashed holder from
-wedging the resource forever. A checker that flagged every overlapping holder
-would report Kahuna's designed behaviour as a bug. So the lock workload checks
-the two properties that survive expiry:
-
-* **exclusion** — hold windows are trimmed to the earliest instant the lease
-  could have lapsed (and shrunk further by `--lease-margin-ms` to absorb
-  clock-rate differences), so an overlap it reports cannot be explained by
-  expiry.
-* **fencing** — tokens never go backwards and strictly increase when the lock
-  changes hands. Only genuinely ordered pairs are compared: if B was invoked
-  before A completed, the protocol promises nothing about their order.
-  Re-acquisition by the current holder returning the *same* token is expected
-  (`LockActor` returns `entry.FencingToken` unchanged) and is not a violation.
-
-Run `lein test` for the negative controls that prove those checkers reject
-real violations while accepting expiry-explained and concurrent ones.
-
-**The append workload needs ≥2 CPUs, and fails fast without them.**
-`elle.core/combine` launches `jepsen.history.task`s that await other tasks, and
-that executor is sized from `availableProcessors`. With one worker a task
-blocks forever on a subtask that can never be scheduled: the run reaches
-`Analyzing...` and sits at 0% CPU indefinitely, which reads as a slow check
-rather than a deadlock. Docker Desktop will happily hand its VM a single CPU on
-an 8-core host (`docker info` → `NCPU`); raise it under Settings → Resources.
-`kahuna.workload.append/check-cpus!` refuses to start rather than let you
-discover this after a full run has already been collected.
-
-Transactions are driven with `TrackAndValidate` read validation and pessimistic
-locking — the combination Kahuna's docs credit for serializable behaviour — so
-`--consistency-model` defaults to `serializable`. Pass `snapshot-isolation` to
-check the weaker claim, or `--locking optimistic` to exercise the other path.
-Kahuna has no native list-append, so an append is a read-modify-write inside
-the session; the read half is deliberate, since it puts the key in the
-transaction's read set.
-
-**Knossos memory is the practical limit, and it bites early.** Search cost is
-driven by per-key concurrency and by the number of *indeterminate* (`:info`)
-operations — not by wall-clock time. Observed on a 4 GB Docker VM:
-
-| Config | Outcome |
+| Path | Purpose |
 |---|---|
-| rate 50, 5 procs/key, 200 ops/key | `{:valid? :unknown, :cause :out-of-memory}` |
-| rate 20, 5 procs/key, 100 ops/key | JVM OOM-killed by the kernel (`-Xmx` exceeded VM RAM — no stack trace, looks like a hang) |
-| rate 15, 3 procs/key, 60 ops/key | analyzed cleanly, `:valid? true` |
-
-`--concurrency` must be an exact multiple of `--concurrency-per-key`;
-`jepsen.independent` asserts at start-up otherwise (e.g. 10 threads cannot run
-3 keys × 3 threads).
-
-So: turn `--concurrency-per-key` down before anything else, keep `-Xmx` below
-the VM's actual RAM, and prefer a longer run at lower density over a dense one
-that cannot be checked. An unanalyzable history proves nothing.
-
-**Clock faults are off by default.** `settimeofday` inside a container moves
-the shared kernel clock — on Docker Desktop that means the whole VM. Kahuna's
-MVCC snapshots and lock leases ride on a hybrid logical clock, so clock skew is
-likely the richest source of bugs here; run `--faults partition,clock` on a
-disposable Linux host, not on your laptop.
+| `src/kahuna/client.clj` | REST client + the response-type → ok/fail/info mapping |
+| `src/kahuna/db.clj` | install / start / stop / kill / pause Kahuna on a node |
+| `src/kahuna/workload/register.clj` | linearizable CAS-register over the KV store |
+| `src/kahuna/workload/lock.clj` | mutual exclusion + fencing tokens over distributed locks |
+| `src/kahuna/workload/append.clj` | Elle list-append over interactive transactions |
+| `src/kahuna/core.clj` | test map, nemesis wiring, CLI |
+| `test/` | negative controls proving the lock checkers can actually fail |
+| `docker/` | 5 Jepsen nodes + a control node |
+| `scripts/build-tarball.sh` | self-contained `Kahuna.Server` publish → `target/kahuna.tar.gz` |
 
 ## Continuous integration
 
 `.github/workflows/jepsen.yml` runs nightly (04:00 UTC) and on manual dispatch,
 as a matrix over workloads and fault sets — `register` under `partition`,
-`kill`, and `partition,kill`; `lock` under `partition` and `partition,kill`.
-
-It should not become a per-PR gate. Jepsen results are nondeterministic,
-and a slow, contended runner manufactures indeterminate operations a fast
-machine would never produce. As a required check it would go red for reasons
-unrelated to the change under review, and a check people learn to ignore is
-worse than no check. A red nightly means "download the artifact and look at the
-history", not "this PR is broken".
+`kill` and `partition,kill`; `lock` and `append` under `partition` and
+`partition,kill`. It is deliberately not a per-PR gate
+([why](DESIGN.md#why-ci-is-not-a-per-pr-gate)).
 
 Differences from a local run:
 
@@ -164,22 +119,5 @@ Differences from a local run:
   timeouts and an unanalyzable history.
 
 `jepsen.cli` exits non-zero when the checker returns `:valid? false`, so the job
-fails on its own. The whole `store/` directory — history, timeline HTML,
-latency plots, per-node server logs — uploads as an artifact on every run.
-
-## Roadmap
-
-Built:
-- [x] `register` — linearizable CAS register (Knossos)
-- [x] `lock` — mutual exclusion + fencing-token monotonicity, lease-aware
-
-Next, in rough order of value:
-- [ ] `append` — written and wired into CI, but **not yet validated against a
-      real cluster**: the only local attempt deadlocked in Elle on a 1-CPU
-      Docker VM before producing a verdict
-      (`start-tx-session` → `try-set`/`try-get` → `commit-tx-session`), checking
-      serializability / snapshot isolation of the 2PC+MVCC layer
-- [ ] `sequencer` — no duplicate or lost ids from `/v1/sequences/next` and
-      `reserve`, across leader changes
-- [ ] membership nemesis using `/v1/cluster/membership` (add/remove node)
-- [ ] snapshot-read workload exercising `readTimestamp` + snapshot holds
+fails on its own. The whole `store/` directory uploads as an artifact on every
+run.

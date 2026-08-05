@@ -38,6 +38,27 @@
 
 (defn- kv-key [k] (str "jepsen/append/" k))
 
+(defn op-id
+  "A fresh 128-bit operation id for one micro-op.
+
+  Every transaction-scoped request must carry *both* a coordinator key and a
+  non-zero operation id. `KeyValuesManager.ClassifyRegistration` treats a
+  request carrying exactly one of the pair as `Malformed` and answers
+  `InvalidInput`, on the grounds that applying it would mutate a participant
+  outside the finalize fence. Omitting the id therefore fails every micro-op —
+  it does not silently degrade to the unregistered path.
+
+  The id is the coordinator's dedup key: resubmitting the same id replays the
+  cached response instead of applying the operation twice. This client never
+  retries a micro-op, so a fresh random id per call is correct. Both halves are
+  masked to 63 bits, since these land in C# `ulong` fields and a negative
+  Clojure long would not deserialize."
+  []
+  (let [u (java.util.UUID/randomUUID)]
+    {:operationIdHigh (bit-and (.getMostSignificantBits u) Long/MAX_VALUE)
+     :operationIdLow  (bit-or 1 (bit-and (.getLeastSignificantBits u)
+                                         Long/MAX_VALUE))}))
+
 (defn- parse-list
   "Kahuna stores opaque bytes; a list is stored as \"1,2,3\". An absent key
   reads as nil, which Elle treats as the empty list."
@@ -102,8 +123,12 @@
               start-type (kc/kv-response-type (:type start))]
           (if-not (= :set start-type)
             ;; Couldn't open a session: nothing happened.
+            ;; Couldn't open a session, so no micro-op was ever sent and the
+            ;; transaction definitely had no effect — :fail even when the type
+            ;; is nil (an unparseable body). The HTTP status rides along
+            ;; because a nil type is otherwise undiagnosable from the history.
             (assoc op :type (if (kc/indeterminate-types start-type) :info :fail)
-                      :error [:start start-type])
+                      :error [:start start-type (:status start)])
             (let [tx-id (:transactionId start)]
               (try+
                 (loop [mops   (seq (:value op))
@@ -130,12 +155,13 @@
                       (case f
                         :r
                         (let [r (kc/post! node "/v1/kv/try-get"
-                                          {:transactionId  tx-id
-                                           :key            key
-                                           :revision       -1
-                                           :readTimestamp  kc/hlc-zero
-                                           :value          kc/persistent
-                                           :coordinatorKey coordinator}
+                                          (merge {:transactionId  tx-id
+                                                  :key            key
+                                                  :revision       -1
+                                                  :readTimestamp  kc/hlc-zero
+                                                  :value          kc/persistent
+                                                  :coordinatorKey coordinator}
+                                                 (op-id))
                                           http)
                               t (kc/kv-response-type (:type r))]
                           (case t
@@ -157,12 +183,13 @@
                               (if (contains? cache k)
                                 (get cache k)
                                 (let [r (kc/post! node "/v1/kv/try-get"
-                                                  {:transactionId  tx-id
-                                                   :key            key
-                                                   :revision       -1
-                                                   :readTimestamp  kc/hlc-zero
-                                                   :value          kc/persistent
-                                                   :coordinatorKey coordinator}
+                                                  (merge {:transactionId  tx-id
+                                                          :key            key
+                                                          :revision       -1
+                                                          :readTimestamp  kc/hlc-zero
+                                                          :value          kc/persistent
+                                                          :coordinatorKey coordinator}
+                                                         (op-id))
                                                   http)
                                       t (kc/kv-response-type (:type r))]
                                   (case t
@@ -171,15 +198,16 @@
                                     (throw+ {:kahuna/abort t :mop [f k v]}))))
                               updated (conj (vec current) v)
                               w (kc/post! node "/v1/kv/try-set"
-                                          {:transactionId   tx-id
-                                           :key             key
-                                           :value           (kc/->b64 (render-list updated))
-                                           :compareValue    nil
-                                           :compareRevision 0
-                                           :expiresMs       0
-                                           :flags           kc/flag-set
-                                           :durability      kc/persistent
-                                           :coordinatorKey  coordinator}
+                                          (merge {:transactionId   tx-id
+                                                  :key             key
+                                                  :value           (kc/->b64 (render-list updated))
+                                                  :compareValue    nil
+                                                  :compareRevision 0
+                                                  :expiresMs       0
+                                                  :flags           kc/flag-set
+                                                  :durability      kc/persistent
+                                                  :coordinatorKey  coordinator}
+                                                 (op-id))
                                           http)
                               t (kc/kv-response-type (:type w))]
                           (if (= :set t)
@@ -193,7 +221,13 @@
                 (catch [:kahuna/abort :must-retry] {:keys [kahuna/abort mop]}
                   (rollback! node coordinator tx-id http)
                   (assoc op :type :info :error [:mop mop abort]))
-                (catch (contains? % :kahuna/abort) {:keys [kahuna/abort mop]}
+                ;; `map?` first: slingshot tries each selector against every
+                ;; thrown object, including the SocketTimeoutExceptions this
+                ;; body raises under partition. `contains?` throws on those,
+                ;; which escapes as an unhandled IllegalArgumentException and
+                ;; skips the rollback below.
+                (catch (and (map? %) (contains? % :kahuna/abort))
+                       {:keys [kahuna/abort mop]}
                   (rollback! node coordinator tx-id http)
                   (assoc op :type (kc/response-class abort)
                             :error [:mop mop abort])))))))))
