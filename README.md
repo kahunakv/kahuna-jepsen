@@ -123,7 +123,9 @@ are never touched, so a pruned run is still fully re-analyzable.
 as a matrix over workloads and fault sets — `register` under `partition`,
 `kill`, `partition,kill` and `pause`; `lock` under `partition`,
 `partition,kill` and `pause`; `append` and `sequencer` under `partition` and
-`partition,kill`. It is deliberately not a per-PR gate
+`partition,kill`; and `register` under `membership`, which runs longer (900s)
+because a single leave/join cycle costs a minute or two. It is deliberately not
+a per-PR gate
 ([why](DESIGN.md#why-ci-is-not-a-per-pr-gate)).
 
 Differences from a local run:

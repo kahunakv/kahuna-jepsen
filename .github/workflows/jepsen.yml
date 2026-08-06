@@ -112,6 +112,25 @@ jobs:
             faults: pause
             concurrency: 9
             ops_per_key: 60
+          # Membership churn is far slower than the other faults: a leave waits
+          # out the departing node's whole shutdown budget (~10-45 s) and a join
+          # waits for a wiped node to backfill from scratch and be promoted
+          # (7-47 s locally, longer on a 4-vCPU runner). One cycle therefore
+          # costs 1-2 minutes, and at the default 180 s time limit this job
+          # would land one cycle — or, if the cluster were slow to form, none at
+          # all, which reads as a pass. Hence the explicit budget: a 900 s run
+          # produced 13 complete cycles locally.
+          #
+          # Note this job is a *single*-fault run. Combining membership with
+          # partition or kill is close to a no-op today: the nemesis only
+          # removes a node from a fully-formed cluster, and a cluster missing a
+          # node is not fully formed. See kahuna.nemesis.membership.
+          - workload: register
+            faults: membership
+            concurrency: 9
+            ops_per_key: 30
+            time_limit: 900
+            membership_interval: 60
 
     env:
       KAHUNA_REPO: ${{ inputs.kahuna_repo || 'kahunakv/kahuna' }}
@@ -206,12 +225,13 @@ jobs:
             --workload ${{ matrix.workload }} \
             --faults ${{ matrix.faults }} \
             --nodes n1,n2,n3,n4,n5 \
-            --time-limit "$TIME_LIMIT" \
+            --time-limit ${{ matrix.time_limit || env.TIME_LIMIT }} \
             --rate "$RATE" \
             --concurrency ${{ matrix.concurrency }} \
             --concurrency-per-key ${{ matrix.concurrency_per_key || 3 }} \
             --ops-per-key ${{ matrix.ops_per_key }} \
             --nemesis-interval ${{ matrix.nemesis_interval || 15 }} \
+            --membership-interval ${{ matrix.membership_interval || 60 }} \
             --tarball target/kahuna.tar.gz
 
       - name: Collect server logs
