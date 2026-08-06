@@ -13,12 +13,14 @@
             [kahuna.db :as kdb]
             [kahuna.workload.append :as append]
             [kahuna.workload.lock :as lock]
-            [kahuna.workload.register :as register]))
+            [kahuna.workload.register :as register]
+            [kahuna.workload.sequencer :as sequencer]))
 
 (def workloads
-  {:register register/workload
-   :lock     lock/workload
-   :append   append/workload})
+  {:register  register/workload
+   :lock      lock/workload
+   :append    append/workload
+   :sequencer sequencer/workload})
 
 (def all-faults
   "Clock faults are NOT in the default set on purpose: settimeofday inside a
@@ -158,7 +160,19 @@
                               Higher values make Knossos's search exponentially
                               more expensive; 100-200 is the practical ceiling."
     :default 100
-    :parse-fn read-string]])
+    :parse-fn read-string]
+
+   [nil "--sequence-name NAME" "Sequence hammered by the sequencer workload.
+                               One sequence on purpose: all traffic lands on a
+                               single Raft partition, which is where leader
+                               changes can lose or replay allocator state."
+    :default "jepsen/sequencer/s1"]
+
+   [nil "--sequence-reserve-max COUNT" "Largest run a :reserve op may request
+                                       (sequencer workload)."
+    :default 10
+    :parse-fn read-string
+    :validate [pos? "must be positive"]]])
 
 (defn -main
   [& args]

@@ -83,6 +83,52 @@ Kahuna has no native list-append, so an append is a read-modify-write inside the
 session. The read half is deliberate: it puts the key in the transaction's read
 set, which is exactly the conflict the isolation level is supposed to police.
 
+## Sequences: gaps are legal, duplicates never are
+
+The sequencer workload checks *less* than it could, on purpose.
+
+Kahuna hands each node an exclusively reserved block of values and lets it drain
+that block locally (`SequenceActor.TryPlanFromBlock`), touching storage only when
+a block is exhausted. Two consequences fall straight out of that design:
+
+- **Gaps are legal.** A leader change surrenders the unused tail of a block. So
+  does an allocation whose acknowledgement was lost. Both burn values no client
+  ever sees. A "no lost ids" check would fail nearly every run with a nemesis and
+  would be testing an invariant Kahuna never claimed.
+- **Out-of-order values are legal.** A node holding `[100,200)` can serve 105
+  *after* another node served 205. There is no global order to violate, so a
+  monotonicity check would manufacture failures rather than find them.
+
+What remains is the property that actually matters: **no value is ever handed to
+two callers.** That holds under any interleaving, on any node, at any time.
+
+This asymmetry makes the workload unusually robust to indeterminacy. A `next`
+that times out may or may not have consumed a value — but either way the result
+is a gap, never a duplicate. Unlike `register`, no verdict here depends on
+classifying an ambiguous response correctly; an `:info` op simply contributes
+nothing. That is a rare luxury in this suite, and it is worth preserving: resist
+adding checks that reintroduce a dependence on getting `:info` right.
+
+The one thing indeterminacy *does* threaten is replay safety, which is why the
+`:next-twice` operation exists. The documented way to retry a timed-out `next` is
+to resend it with the same idempotency key; that must return the original
+allocation rather than burning a second value. Under `partition,kill` the replay
+may reach a different leader than the original — exactly where an idempotency
+record could go missing.
+
+**Allocation ranges are inclusive at both ends.** The server plans
+`start = current + increment` and `end = current + increment * count`, so a range
+covers exactly `count` values and `[1,5]` followed by `[6,10]` is adjacent, not
+overlapping. An off-by-one here would report the most common shape in any history
+as a duplicate.
+
+**A run with too few allocations is `:unknown`, not clean.** An empty history
+satisfies "no duplicates" perfectly, so without a floor a botched setup reads as
+a pass — the same trap as `:empty-transaction-graph` in the append workload. The
+sequencer's `setup!` also retries sequence creation, because it runs before the
+cluster has finished electing and a single-shot create leaves every subsequent
+operation answering `NotFound`.
+
 ## The append workload needs ≥2 CPUs, and fails fast without them
 
 `elle.core/combine` launches `jepsen.history.task`s that await other tasks, and

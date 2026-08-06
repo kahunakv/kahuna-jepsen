@@ -64,6 +64,20 @@ jobs:
             faults: partition,kill
             concurrency: 10
             ops_per_key: 60
+          # Mutual-exclusion violations need the nemesis cycling faster than the
+          # 10s lock lease: at the default 15s interval most leases expire in a
+          # quiet window and the overlap never forms. Locally this config found
+          # 4 exclusion violations in 8 runs where interval 15 found 0 in 5, so
+          # without it the nightly is blind to that whole class of bug.
+          #
+          # Expect this job to be red roughly every other night until the
+          # exclusion bug is fixed. That is the job working, not a flake --
+          # see FINDINGS.md before assuming a failure here is noise.
+          - workload: lock
+            faults: partition
+            concurrency: 10
+            ops_per_key: 60
+            nemesis_interval: 5
           # Elle needs >=2 CPUs or its analysis deadlocks; ubuntu-latest has 4.
           # Transactions are slower than single-key ops, so run fewer clients.
           - workload: append
@@ -160,7 +174,7 @@ jobs:
             echo "$n reachable"
           done
 
-      - name: Run ${{ matrix.workload }} / ${{ matrix.faults }}
+      - name: Run ${{ matrix.workload }} / ${{ matrix.faults }} @ interval ${{ matrix.nemesis_interval || 15 }}
         # jepsen.cli exits non-zero when the checker returns :valid? false, so
         # no result parsing is needed here.
         run: |
@@ -173,6 +187,7 @@ jobs:
             --concurrency ${{ matrix.concurrency }} \
             --concurrency-per-key ${{ matrix.concurrency_per_key || 3 }} \
             --ops-per-key ${{ matrix.ops_per_key }} \
+            --nemesis-interval ${{ matrix.nemesis_interval || 15 }} \
             --tarball target/kahuna.tar.gz
 
       - name: Collect server logs

@@ -6,17 +6,248 @@ For *why* the tests are shaped the way they are, see [DESIGN.md](DESIGN.md).
 
 | Workload | Checks | Status |
 |---|---|---|
-| `register` | linearizable CAS register (Knossos) | green under `partition`, `kill`, `partition,kill` |
-| `lock` | mutual exclusion + fencing-token monotonicity, lease-aware | green; previously found a real bug, since fixed and verified |
-| `append` | Elle list-append over interactive transactions | found three real bugs; two fixed and verified, HTTP 500 all but fixed |
+| `register` | linearizable CAS register (Knossos) | green; found a stale-read violation, since fixed and verified |
+| `lock` | mutual exclusion + fencing-token monotonicity, lease-aware | green as of Kommander 1.0.10; found a fencing rollback (fixed, 16/16 verified) and a checker bug that faked exclusion violations |
+| `append` | Elle list-append over interactive transactions | found four real bugs; three fixed (write skew closed on absence, 29 runs), HTTP 500 all but fixed |
+| `sequencer` | no id handed out twice; allocation-range integrity; idempotent replay | new; found an HTTP 500 on the redirect path before a nemesis was even enabled |
 
 Not started:
 
-- [ ] `sequencer` — no duplicate or lost ids from `/v1/sequences/next` and
-      `reserve`, across leader changes
 - [ ] membership nemesis using `/v1/cluster/membership` (add/remove node)
 - [ ] snapshot-read workload exercising `readTimestamp` + snapshot holds
 - [ ] `pause` fault in the CI matrix (supported by the harness, not yet wired in)
+
+## Closed: "mutual exclusion violated" was a bug in *this* checker
+
+For a while this was recorded here as the most serious finding in the project:
+two owners each told they held the same lock, in the worst case for **8.3 seconds
+of a 10 s lease**, appearing 4 times in 8 runs and in no run before the Kahuna
+lock fix. All of it was a false positive produced by `holds`.
+
+**The mechanism.** All three violations have one history shape. The holder
+invokes a release, which **times out** because the partition cut the ack path
+(`:info`), and Jepsen renumbers the process; the same thread later retries the
+release. `holds` handled `[:invoke :release]` with
+`(assoc h :release-start (:time op))`, so each retry **overwrote** the recorded
+release time. The hold was then closed using the *retry's* start, stretching the
+"definite hold" window seconds past the *first* release attempt — across a period
+in which that first release had already committed on the server.
+
+That the release really did commit is provable from the histories: the next
+grants mint cleanly ascending tokens, and `TryLock` only mints
+`entry.FencingToken + 1` when the head record reads free. A leader minting *k+1*
+had applied the unlock. The lock was genuinely free; the grants were correct.
+
+**The server was exonerated**, including the `State == Locked` busy gate that
+this file previously blamed. The gate was granting against unlock records that
+had genuinely committed.
+
+Why it only appeared after the lock fix: it needs a release to time out
+mid-partition *and* the next grant to land inside the stale window. The lock fix
+(correctly) stopped refusing grants against cold-loaded unlock records, so
+post-release grants started completing promptly inside that window.
+
+**Fix** (in `src/kahuna/workload/lock.clj`): keep the *earliest* `release-start`
+(`(update h :release-start #(or % (:time op)))`), and end pending holds at
+`min(lease-end, release-start)` instead of ignoring an in-flight release. Two
+negative controls added in `test/kahuna/workload/lock_test.clj` — an
+indeterminate-release-then-retry history must be **accepted**, and an overlap
+occurring before any release attempt must still be **rejected**, so the fix
+cannot have simply blinded the checker. `lein test kahuna.workload.lock-test`:
+8 tests, 12 assertions, 0 failures.
+
+**A caution about how this was nearly mis-closed.** The first write-up credited
+Kommander 1.0.10 with fixing it, on the strength of an 8-of-8 clean sweep and a
+"0.4 % by chance" argument. That was wrong: those runs already had the fixed
+checker in the working tree, so two changes moved at once and the checker fix
+alone explains the result. The statistic was also void — its 4-in-8 prior had
+been measured with the *buggy* checker. When a test-suite change and a server
+change land in the same window, a clean run set attributes to neither.
+
+## Closed: fencing tokens roll back under partition alone
+
+The lock partition's fencing counter **rolled back 36 grants and replayed them**,
+with no process ever killed:
+
+```
+… 113(n3) 114(n3) 115(n5)   ← monotonic to 115
+   79(n5)  80(n5)  81(n4)   ← restarts at 79
+   82(n5)  83(n3)  84(n5) … ← monotonic again
+```
+
+Each replayed token went to a *different* owner than the first time, five
+seconds after a single node was isolated — and on the **majority** side.
+
+Not the previously-fixed fencing bug: that one needed `kill` to create a stale
+node. Root-cause hypothesis (code-traced, not yet confirmed): a token is minted
+from `entry.FencingToken + 1` where the entry is loaded from *locally applied*
+state, and nothing makes a newly promoted leader finish applying the committed
+log before it mints. Reads now gate on `ConfirmLeadershipAsync`, which carries a
+promotion barrier; **writes do not**.
+
+**Still failing after the first fix attempt** (2026-08-06). Now reproduced
+locally at `--nemesis-interval 5`, with a *larger* rollback than CI's: **125 →
+16**, 1 of 8 runs. At the default interval 15, 5 of 5 were clean — so shortening
+the interval is what surfaces it, and a safety property should not depend on how
+often leadership moves.
+
+That fix corrected this file's earlier diagnosis: the **cold-load** path (backend
+∪ overlay) was already right; the stale state was the **resident** cache entry on
+a *former* leader, frozen at its last tenure and reused on re-promotion.
+
+**A second fix attempt (Kommander 1.0.9) did not fix it**: fencing failed 2 of 8
+runs. The rate is flat versus 1.0.8 (1 of 8) — not a distinguishable difference
+at this sample size — but the *severity* is worse. Max token reached only 57 of
+109 acquires in one run, and another produced a failure mode not seen before:
+**`:token-reused-by-other-owner`**, the same token handed to two different
+owners. That is worse than a monotonicity break, because a resource fencing on
+token comparison cannot order two holders carrying an identical token at all.
+
+The exclusion violations recorded alongside these were a checker bug, not a
+consequence of this one — see the closed section above.
+
+Diagnose by extracting the token sequence in grant order and looking for a
+discontinuity, rather than trusting the violation list alone:
+
+```bash
+grep -oE ':token [0-9]+, :node "n[0-9]"' store/kahuna-lock-partition/latest/jepsen.log
+```
+
+### Fixed in Kommander 1.0.10 — verified 16 of 16
+
+Root cause was in Kommander, not Kahuna: promotion drains read the WAL while
+enqueued writes still sat in the write scheduler's queue, so the reads missed
+them. Old code silently skipped them (the original 115 → 79); 1.0.9's new
+gap-detection misclassified them as holes and orphaned everything above on
+ordinary commits, which is why severity got worse rather than better. Server
+logs show n5 advertising freshness 117 while its own drain reported "hole at 19",
+then serving anyway. Kahuna's only change was the pin, 1.0.9 → 1.0.10.
+
+**Two independent 8-run sets, all clean**, at the configuration that produced the
+2-of-8 rate (`--faults partition`, 180 s, concurrency 10, rate 10,
+`--nemesis-interval 5`):
+
+| Set | Acquires (min–max) | Fencing |
+|---|---|---|
+| 1 | 85–128 | 8 of 8 clean |
+| 2 | 66–155 | 8 of 8 clean |
+
+No `:token-went-backwards`, no `:token-reused-by-other-owner`, and `max-token`
+tracks `acquire-count` within a few in every run. At the 25 % prior, 16
+consecutive clean runs is a **~1 %** outcome by chance; one 8-run set (~10 %)
+was explicitly judged insufficient, which is why a second was run.
+
+Unlike the exclusion result above, this one is **not** confounded by the
+concurrent checker fix: `fencing-checker` builds its own `acquires` pass straight
+from the history and never calls `holds`. The changed code feeds
+`exclusion-checker` alone.
+
+Verified at `--nemesis-interval 5` only; interval 15 is strictly less sensitive
+to this bug, so it would add nothing.
+
+## Closed: write skew (`:G2-item`) under partition + kill
+
+An anti-dependency cycle — two transactions each read a key the other then
+wrote, with no serial order explaining it. Elle rules out `:repeatable-read`
+and `:serializable`:
+
+```clojure
+:steps ({:type :rw, :key 21, :value 12, :value' 13}
+        {:type :rw, :key 24, :value 26, :value' 28}
+        {:type :wr, :key 24, :value 28})
+```
+
+**1 of 15 informative runs (~7 %)** at concurrency 10 / rate 15. Both
+transactions committed, so this depends on no classification judgment in the
+harness — it comes from committed reads and writes alone. That matters because
+the config under test is `Pessimistic` + `TrackAndValidate`, and read-set
+validation is exactly the mechanism meant to prevent write skew.
+
+A fix attempt on 2026-08-06 produced 6 clean runs — which **does not verify it**.
+At a 7 % rate, six clean runs happen ~65 % of the time by chance. Verifying needs
+~30 runs, or better, a deterministic test of the interleaving.
+
+A third distinct class, not a recurrence of the aborted read or the lost update.
+Whether it is *new* is undetermined: 0 in 22 runs on the previous build and 1 in
+15 here is consistent with it having been there all along (at 7 %, 22 clean runs
+happen ~20 % of the time), and it may simply have been invisible while louder
+anomalies were failing the same runs.
+
+### Closed on Kommander 1.0.10 — 29 runs, 29 clean
+
+No `:G2-item`, no washouts, every run `:valid? true`. Commit counts 78–744, so
+the runs sat squarely in the sustained-load window where the anomaly appeared.
+At the 7 % rate, 29 clean runs is a **~12 %** outcome by chance — the ~30-run bar
+set when the earlier 6-run attempt was judged worthless (~65 % by chance).
+
+One run committed only 10 transactions and is discounted, making the honest count
+**28 informative runs**. Recorded rather than silently included, since a
+near-empty run padding the denominator is exactly how a 7 % bug hides.
+
+**Closed on absence, not on a traced fix** — weaker than the fencing case, and
+worth remembering as such. No code change was ever tied to this anomaly. The
+plausible mechanism is the Kommander 1.0.10 fix: a leader serving on an
+incomplete committed projection would let `TrackAndValidate` pass a read set it
+should have rejected, since validation only sees what the node has applied. That
+would make write skew a side effect of the same defect as the fencing rollback —
+consistent with everything observed, but unconfirmed. A deterministic test of the
+interleaving is what would actually settle it.
+
+Reopen on any `:G2-item` at concurrency 10 / rate 15 on 1.0.10 or later; given the
+~12 % residual, treat a recurrence as "it was always there", not a new regression.
+
+## Closed: stale reads from a minority-partitioned node
+
+**Fixed and verified 2026-08-06** — `register / partition` 8 of 8 clean, against
+a prior 1-in-3 reproduction rate and a CI failure. The fix,
+`ConfirmLeadershipForRead`, gates authoritative local reads on a
+quorum-confirmed Raft read-index instead of the local `AmILeader` belief,
+answering `MustRetry` when confirmation fails — applied across the KV, lock and
+sequence locators.
+
+The original report follows, because the diagnosis technique is reusable.
+
+A node cut off from the majority keeps
+answering reads with its last-known value, returned as a normal successful
+`Get`. Knossos reports a linearizability violation; a client has no way to tell
+the response apart from a current read.
+
+The asymmetry is the tell: on the same isolated node, **writes correctly return
+`MustRetry`** — it knows it cannot replicate. Only reads are served from local
+state without a quorum check.
+
+```
+20:00:04.47  proc 244 (n2)  :info  :write [19 0]  :must-retry   ← writes refuse
+20:00:06.44  proc  81 (n1)  :ok    :write [19 1]
+20:00:06.51  proc 253 (n2)  :ok    :read  [19 0]  ← STALE, reported OK
+20:00:09.46  proc 253 (n2)  :ok    :read  [19 0]  ← still stale, ~11 s in
+```
+
+n2's value froze at the value committed just before the partition, while the
+rest of the cluster moved on. Reproduced locally in **1 of 3 runs** with a
+different partition shape and key, so it is not a one-off.
+
+`KeyValueLocator.LocateAndTryGetValue` serves a read locally when
+`raft.AmILeader(...)` is true, or when the resolved leader equals the local
+endpoint — both *local beliefs* rather than confirmed quorum. An isolated leader
+holds that belief until it steps down. Fixing it needs a read index or a leader
+lease, answering `MustRetry` when leadership cannot be confirmed.
+
+Whether this was a regression is **still unresolved** — the job was green
+throughout the project's history and 1-in-3 is high, which points that way, but
+the `AmILeader`-gated read is not new code, and a bisect was blocked because
+`39ec8e0` does not build standalone (`CS0246: IRaft`; it pins an older Kommander
+than the current fixes need). Moot for remediation, open for release notes.
+
+Read throughput under the new gate is **not** established by these runs: the
+Jepsen generator is rate-limited, so it never saturates reads. Each confirmed
+read now dispatches to the partition's single-writer thread, which is a
+plausible serialization point at high QPS — that needs a throughput benchmark,
+not a fault-injection run.
+
+To diagnose a failing run, map the stale reader to its node —
+`thread = process mod concurrency`, `node = thread mod 5 + 1` — and check it
+against the `:start-partition` topology in `jepsen.log`.
 
 ## Closed: fencing tokens regressed under partition + kill
 
@@ -255,7 +486,11 @@ reason — a nil response type is otherwise undiagnosable from the history.
 
 ## Harness bugs worth remembering
 
-Both produced verdicts that looked like server findings.
+All of these produced verdicts that looked like server findings.
+
+**`release-start` overwritten by release retries** invented mutual-exclusion
+violations for months of runs — the largest false finding in the project. Written
+up in full in the closed exclusion section above.
 
 **Missing operation ids** made every transaction fail with `InvalidInput`, so
 nothing committed and Elle reported `:empty-transaction-graph`. Every
@@ -267,3 +502,21 @@ evaluated against every thrown object, including the `SocketTimeoutException`s
 that partitions produce; `contains?` throws on those, which escaped as an
 unhandled `IllegalArgumentException` *and* skipped the rollback. Selectors that
 inspect map contents need a `map?` guard first.
+
+## Running the tests: two traps that fake results
+
+**`lein` and `java` live in the `jepsen-control` container, not on the host.**
+Running `lein` on the host fails with `command not found`. Worse, `docker exec
+jepsen-control bash -lc '…'` *also* fails: a **login** shell re-reads
+`/etc/profile` and discards the image's `JAVA_HOME`/`PATH`, so `lein` is found
+and `java` is not. Use `docker exec -w /jepsen jepsen-control bash -c '…'` — no
+`-l`.
+
+**Never derive a run's verdict from "the newest store directory" alone.** When
+the run fails to start, that lookup silently walks back to a *previous* run and
+reports its results as if they were current. This happened: eight failed
+invocations produced a complete, plausible 8-run table copied from the prior
+build's series, and it was caught only because the numbers were identical to
+those already on record. Capture the newest directory *before* the run and assert
+that a new one appeared; parse `results.edn` rather than scraping console text,
+and treat a missing verdict as an error rather than defaulting it to a pass.

@@ -134,9 +134,13 @@
            pending  {}    ; thread -> partially built hold
            done     []]
       (if-not ops
-        ;; Anything still held at the end of the history runs to lease expiry.
+        ;; Anything still held at the end of the history runs to lease expiry —
+        ;; or to its first release attempt, whichever came first: an in-flight
+        ;; release means the hold is no longer definite past its invoke.
         (concat done (keep (fn [[_ h]]
-                             (let [end (- (:lease-end h) margin-ns)]
+                             (let [end (- (min (:lease-end h)
+                                               (or (:release-start h) (:lease-end h)))
+                                          margin-ns)]
                                (when (< (:start h) end)
                                  (assoc h :end end))))
                            pending))
@@ -157,11 +161,17 @@
                      done))
 
             [:invoke :release]
-            ;; Mark when the release began: up to that instant the owner
-            ;; certainly still held the lock.
+            ;; Mark when the FIRST release began: up to that instant the owner
+            ;; certainly still held the lock; from then on it may not. Keep the
+            ;; earliest attempt — a release that times out (:info) leaves the hold
+            ;; pending and the thread retries, and overwriting release-start with
+            ;; the retry's invoke time would extend the \"definite hold\" across a
+            ;; window where the first release may already have committed server-side
+            ;; (its ack lost to a partition), inventing overlaps the server never
+            ;; produced.
             (recur (next ops) (assoc invokes t (:time op))
                    (if-let [h (get pending t)]
-                     (assoc pending t (assoc h :release-start (:time op)))
+                     (assoc pending t (update h :release-start #(or % (:time op))))
                      pending)
                    done)
 

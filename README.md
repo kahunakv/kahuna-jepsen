@@ -6,7 +6,7 @@ Jepsen tests for [Kahuna](https://github.com/kahunakv/kahuna) — a distributed
 lock manager, key/value store and sequencer built on Raft (Kommander) with
 MVCC and 2PC transactions.
 
-Three workloads run against a 5-node cluster while a nemesis partitions,
+Four workloads run against a 5-node cluster while a nemesis partitions,
 kills and pauses nodes:
 
 | Workload | What it checks |
@@ -14,6 +14,7 @@ kills and pauses nodes:
 | `register` | linearizability of a CAS register over the KV store (Knossos) |
 | `lock` | mutual exclusion + fencing-token monotonicity, lease-aware |
 | `append` | serializability of interactive transactions (Elle list-append) |
+| `sequencer` | no id handed out twice, allocation-range integrity, idempotent replay |
 
 - **[DESIGN.md](DESIGN.md)** — why the tests are shaped this way, and the limits
   you will hit. Read it before trusting or dismissing a red result.
@@ -55,15 +56,15 @@ reach for:
 
 | Flag | Meaning |
 |---|---|
-| `--workload` | `register`, `lock` or `append` |
+| `--workload` | `register`, `lock`, `append` or `sequencer` |
 | `--faults` | comma-separated `partition,kill,pause,clock`, or `all` |
 | `--concurrency` | total client threads; **must** be an exact multiple of `--concurrency-per-key` |
 | `--rate` | requests/sec per client |
 | `--time-limit` | seconds of load |
 | `--ephemeral` | use `Ephemeral` durability instead of `Persistent` |
 
-Run `lein test` for the unit tests — negative controls proving the lock
-checkers actually reject real violations.
+Run `lein test` for the unit tests — negative controls proving the lock and
+sequencer checkers actually reject real violations.
 
 `docker/up.sh` generates an SSH key pair into `docker/secret/` (gitignored) and
 bakes the public half into the node images. Key auth is mandatory rather than
@@ -80,9 +81,25 @@ A run ends with a verdict map and either `Everything looks good!` or
 - `:empty-transaction-graph` (append) — **nothing committed**, so there was
   nothing to analyze. Check the client's failure tally and the node logs before
   reading it as anything else; see [FINDINGS.md](FINDINGS.md).
+- `:insufficient-data` (sequencer) — fewer than 25 allocations were observed, so
+  "no duplicates" is vacuous. The checker returns `:valid? :unknown` rather than
+  success; a run where every operation failed must not read as a clean run.
 
 Everything from a run lands in `store/<test>/<timestamp>/` — history, verdict,
 timeline HTML, latency plots and per-node server logs.
+
+**Reclaiming disk.** Kahuna logs at debug level, so each run drops ~70 MB of
+server logs into `store/`; a few dozen runs fill a disk.
+
+```bash
+scripts/prune-logs.sh --dry-run   # show what would go
+scripts/prune-logs.sh             # delete them
+```
+
+It deletes `n*/kahuna.log` only from **passing** runs, keeping failing runs
+(they are the evidence behind every investigation), anything written in the last
+hour, and any run with no verdict. History, `results.edn`, timeline and plots
+are never touched, so a pruned run is still fully re-analyzable.
 
 ## What's here
 
@@ -93,8 +110,9 @@ timeline HTML, latency plots and per-node server logs.
 | `src/kahuna/workload/register.clj` | linearizable CAS-register over the KV store |
 | `src/kahuna/workload/lock.clj` | mutual exclusion + fencing tokens over distributed locks |
 | `src/kahuna/workload/append.clj` | Elle list-append over interactive transactions |
+| `src/kahuna/workload/sequencer.clj` | duplicate-free id allocation across leader changes |
 | `src/kahuna/core.clj` | test map, nemesis wiring, CLI |
-| `test/` | negative controls proving the lock checkers can actually fail |
+| `test/` | negative controls proving the lock and sequencer checkers can actually fail |
 | `docker/` | 5 Jepsen nodes + a control node |
 | `scripts/build-tarball.sh` | self-contained `Kahuna.Server` publish → `target/kahuna.tar.gz` |
 
