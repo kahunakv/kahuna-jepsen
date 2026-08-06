@@ -473,35 +473,48 @@ recovery is simply slower than the fault schedule.
 
 ### Recovery baseline (healthy runs)
 
-`kahuna.checker.recovery` now measures this on every run. From a 300 s
-`append` / `partition,kill` run at the default 15 s interval — a **healthy**
-one, 1163 committed transactions:
+`kahuna.checker.recovery` measures this on every run. Across 7 × 300 s
+`append` / `partition,kill` runs at the default 15 s interval, all of which
+committed normally (325–1163 transactions):
 
 ```
-:windows 24  :recovered 15  :never-recovered 6
-:recovery-ms {:min 3, :median 164, :p95 10622, :max 10622}
-:starved-window-ms (249 2377 2751 6623 7498 11299)
+75 recovered windows, 7 starved
+median 3330 ms   p90 16248 ms   max 54422 ms
 ```
 
-Two things follow, and a third does not.
+**Read the failure errors before reading these numbers.** The long windows are
+dominated by `:connection-refused`, which means the server processes were not
+listening — five self-contained .NET servers booting and replaying RocksDB on a
+loaded Docker Desktop VM. That is startup cost, not consensus recovery, and it
+will differ on other hardware. These numbers characterise *this environment*
+recovering, not Kahuna resolving a leader.
 
-* **Recovery is usually immediate.** A median of 164 ms says that when the
-  cluster is left alone it is serving again almost at once. The blunt version of
-  hypothesis (2) — "recovery is always slower than the fault schedule" — is not
-  supported.
-* **But the tail reaches the fault interval.** The slowest recovery was 10.6 s,
-  against a 15 s interval. There is not much headroom, and one window went
-  11.3 s with nothing succeeding.
-* **This does not explain the commit-nothing runs.** Four of the six starved
-  windows were shorter than 3 s — the nemesis simply hit again quickly, which
-  says nothing about how fast the cluster *could* have recovered. And this run
-  committed plenty, so it is a baseline for the healthy case, not a measurement
-  of the pathological one.
+One window out of 75 is the interesting shape: 36 s, of which 178 failures were
+`[:start :must-retry 200]` — nodes up and answering, no leader resolvable. That
+is the same signature as the commit-nothing runs above. One window is a lead,
+not a finding.
 
-**The original question is therefore still open.** What is needed is this
-measurement on a run that commits nothing. Every run now carries it, so it is a
-matter of collecting append runs until one of the ~1-in-10 appears and reading
-its `:recovery` map. Do not treat the baseline above as the answer.
+**The original question is still open**, and this measurement cannot close it
+as built. What would: the sub-window from *all processes listening again* to
+*first success*, which subtracts startup and leaves only consensus recovery.
+The history alone cannot see process liveness, so that needs a readiness probe
+in the nemesis `:start` path or correlation against node logs.
+
+#### An earlier version of this section was wrong
+
+It reported a median of 164 ms from a single run and concluded recovery was
+"usually immediate". The checker that produced it opened a recovery window at
+*every* fault-ending nemesis op, so under `partition,kill` it timed recovery
+from a partition heal while nodes were still killed — measuring a cluster that
+was still under attack, and attributing the result to whichever fault happened
+to end first. It also made the per-fault breakdown look meaningful when it was
+not.
+
+Fixed in `kahuna.checker.recovery`: a window now opens only when the *last*
+outstanding fault ends, and `a-window-opens-only-when-the-last-fault-ends`
+pins it. The lesson is the same one this file keeps recording — a measurement
+that fails silently is more dangerous than a checker that goes red, because
+nothing about a plausible number invites a second look.
 
 ```
 Kommander.RaftException: Invalid partition: 3

@@ -41,23 +41,25 @@
             [jepsen [checker :as checker]
                     [history :as h]]))
 
-(def fault-end-fs
-  "Nemesis :fs that *end* a fault, and so open a recovery window.
+(def fault-pairs
+  "Each fault's beginning :f mapped to the :f that ends it.
 
-  `:start` is jepsen.nemesis.combined's db-nemesis restarting killed nodes,
-  `:resume` un-SIGSTOPs a paused one, `:stop-partition` heals the network, and
-  `:join` is this suite's membership nemesis putting a node back in the roster."
-  #{:start :resume :stop-partition :join})
+  `:kill`/`:start` is jepsen.nemesis.combined's db-nemesis, `:pause`/`:resume`
+  is SIGSTOP/SIGCONT, `:start-partition`/`:stop-partition` is the network, and
+  `:leave`/`:join` is this suite's membership nemesis."
+  {:kill            :start
+   :pause           :resume
+   :start-partition :stop-partition
+   :leave           :join})
 
-(def fault-start-fs
-  "Nemesis :fs that *begin* a fault, and so close any open recovery window.
+(def fault-start-fs (set (keys fault-pairs)))
+(def fault-end-fs   (set (vals fault-pairs)))
 
-  A window that closes this way never saw a successful operation — the cluster
-  was hit again before it recovered. Those are the interesting ones."
-  #{:kill :pause :start-partition :leave})
+(def ^:private end->start
+  (into {} (map (fn [[a b]] [b a]) fault-pairs)))
 
 (defn nemesis-ops
-  "The nemesis ops split into {:invokes [...] :completions [...]}, in time order.
+  "The nemesis ops, in order, each tagged ::role with :invoke or :complete.
 
   Nemesis invocations and their completions BOTH have :type :info, so the usual
   invoke?/ok? predicates cannot tell them apart. The nemesis is a single
@@ -71,12 +73,15 @@
     measuring from the invocation would charge the restart itself to recovery.
   * A recovery window CLOSES at the invocation of the next fault. That is when
     the cluster stops being left alone — measuring to the completion would
-    credit it with time it spent under attack."
+    credit it with time it spent under attack.
+
+  Tagging positionally rather than by :index keeps this usable on a plain
+  vector of op maps, which is what the tests pass."
   [history]
-  (let [ops (->> history (h/remove h/client-op?) vec)
-        by  (fn [pred] (keep-indexed (fn [i op] (when (pred i) op)) ops))]
-    {:invokes     (vec (by even?))
-     :completions (vec (by odd?))}))
+  (->> history
+       (h/remove h/client-op?)
+       (map-indexed (fn [i op] (assoc op ::role (if (even? i) :invoke :complete))))
+       vec))
 
 (defn ms
   "Jepsen records :time in nanoseconds since the start of the test."
@@ -84,7 +89,15 @@
   (when nanos (long (/ nanos 1e6))))
 
 (defn windows
-  "Pairs each fault-ending nemesis op with the first client :ok that follows it.
+  "Recovery windows: periods when NO fault is active, paired with the first
+  client :ok in each.
+
+  A window opens only when the *last* outstanding fault ends, not when any
+  single fault-ending op fires. Faults overlap — under `partition,kill` the
+  nemesis will heal a partition while nodes are still killed — and timing
+  'recovery' from that heal measures a cluster that is still under attack. The
+  first version of this checker did exactly that, and produced a confident,
+  entirely unsound table of per-fault recovery latencies.
 
   A window is closed by whichever comes first: a successful operation
   (`:recovered? true`), the next fault (`:recovered? false`), or the end of the
@@ -97,40 +110,49 @@
         history (h/history history)
         ;; Realised once: the history may be large and we scan it repeatedly.
         oks     (vec (->> history (h/filter h/client-op?) (h/filter h/ok?)))
-        {:keys [invokes completions]} (nemesis-ops history)
-        ok-time (fn [after]
+        nem     (nemesis-ops history)
+        ;; First :ok strictly inside (from, to). `to` nil means "to the end".
+        ok-in   (fn [from to]
                   (->> oks
-                       (drop-while #(<= (:time %) after))
+                       (drop-while #(<= (:time %) from))
+                       (take-while #(or (nil? to) (< (:time %) to)))
                        first
                        :time))
-        ;; Invocations, not completions — see `nemesis-ops`.
-        next-fault-time (fn [after]
-                          (->> invokes
-                               (drop-while #(<= (:time %) after))
-                               (filter #(contains? fault-start-fs (:f %)))
-                               first
-                               :time))]
-    (->> completions
-         (filter #(contains? fault-end-fs (:f %)))
-         (map (fn [op]
-                (let [t      (:time op)
-                      ok-t   (ok-time t)
-                      next-t (next-fault-time t)]
-                  (cond
-                    ;; Recovered before anything else happened.
-                    (and ok-t (or (nil? next-t) (< ok-t next-t)))
-                    {:f (:f op) :at-ms (ms t) :recovered? true
-                     :recovered-after-ms (ms (- ok-t t))}
+        ;; Resolves an open window against the moment it closed.
+        close   (fn [opened closed-at end-tag]
+                  (if-let [ok-t (ok-in opened closed-at)]
+                    {:at-ms (ms opened) :recovered? true
+                     :recovered-after-ms (ms (- ok-t opened))}
+                    (merge {:at-ms (ms opened) :recovered? false :end end-tag}
+                           (when closed-at
+                             {:window-ms (ms (- closed-at opened))}))))
+        final
+        (reduce
+          (fn [{:keys [active opened] :as st} op]
+            (let [t (:time op)
+                  f (:f op)
+                  r (::role op)]
+              (cond
+                ;; A fault begins, closing any window that was open.
+                (and (= :invoke r) (contains? fault-start-fs f))
+                (cond-> (assoc st :active (conj active f) :opened nil)
+                  opened (update :windows conj (close opened t :next-fault)))
 
-                    ;; Hit again before a single request succeeded. This is the
-                    ;; measurement that answers the open question.
-                    next-t
-                    {:f (:f op) :at-ms (ms t) :recovered? false :end :next-fault
-                     :window-ms (ms (- next-t t))}
+                ;; A fault ends. A window opens only once nothing is left
+                ;; active — see the docstring.
+                (and (= :complete r) (contains? fault-end-fs f))
+                (let [active' (disj active (end->start f))]
+                  (assoc st :active active'
+                            :opened (if (seq active') opened t)))
 
-                    :else
-                    {:f (:f op) :at-ms (ms t) :recovered? false :end :history}))))
-         vec)))
+                :else st)))
+          {:active #{} :opened nil :windows []}
+          nem)]
+    ;; A window still open when the history ends is censored, not starved: the
+    ;; test simply stopped watching. It still counts as recovered if something
+    ;; succeeded inside it.
+    (cond-> (:windows final)
+      (:opened final) (conj (close (:opened final) nil :history)))))
 
 (defn- percentile
   [sorted p]

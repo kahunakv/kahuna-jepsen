@@ -128,10 +128,31 @@
     (is (= [90 90 90] (map :recovered-after-ms (:detail r))))))
 
 (deftest reports-a-latency-summary-across-windows
-  (let [r (check* [(nem 0 :start :all)    (nem 10 :start {})   (ok 110)
+  ;; Three kill/start cycles. The :kill invocations are not decoration — they
+  ;; are what separates one recovery window from the next. A history of bare
+  ;; :start completions is not one a nemesis can produce.
+  (let [r (check* [(nem 0 :kill :one)     (nem 5 :kill {})
+                   (nem 8 :start :all)    (nem 10 :start {})   (ok 110)
+                   (nem 190 :kill :one)   (nem 195 :kill {})
                    (nem 200 :start :all)  (nem 210 :start {})  (ok 510)
+                   (nem 590 :kill :one)   (nem 595 :kill {})
                    (nem 600 :start :all)  (nem 610 :start {})  (ok 1310)])]
+    (is (= 3 (:windows r)))
     (is (= {:min 100 :median 300 :p95 700 :max 700} (:recovery-ms r)))))
+
+(deftest a-window-opens-only-when-the-last-fault-ends
+  ;; The bug this checker shipped with. Under partition,kill the nemesis heals
+  ;; the network while nodes are still killed; timing "recovery" from that heal
+  ;; measures a cluster that is still missing processes. Here the partition is
+  ;; healed at 2000 but the kill is outstanding until 5000, so recovery is
+  ;; 500 ms (5500 - 5000), not 3500 ms (5500 - 2000).
+  (let [r (check* [(nem 0 :kill :majority)        (nem 100 :kill {})
+                   (nem 200 :start-partition :one) (nem 300 :start-partition {})
+                   (nem 1900 :stop-partition nil)  (nem 2000 :stop-partition :healed)
+                   (nem 4900 :start :all)          (nem 5000 :start {})
+                   (ok 5500)])]
+    (is (= 1 (:windows r)))
+    (is (= 500 (:recovered-after-ms (first (:detail r)))))))
 
 ;; ---------------------------------------------------------------------------
 ;; Degenerate input
