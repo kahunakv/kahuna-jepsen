@@ -155,6 +155,28 @@
     (is (= 500 (:recovered-after-ms (first (:detail r)))))))
 
 ;; ---------------------------------------------------------------------------
+;; Port-open time is reported, and is not confused with readiness
+;; ---------------------------------------------------------------------------
+
+(deftest port-open-time-is-reported-and-recovery-measured-from-the-completion
+  ;; kahuna.db's start! waits for the HTTP port, so the :start COMPLETION is the
+  ;; moment the node is listening, and :port-open-ms is what that took.
+  ;;
+  ;; Recovery is measured from that completion: 200 ms here. Note what this
+  ;; does NOT claim — the node may still be uninitialised and refusing every
+  ;; request, and no client-observable signal distinguishes the two. So
+  ;; :recovery-ms is an upper bound on consensus recovery, and :port-open-ms is
+  ;; not a quantity to subtract from it.
+  (let [r (check* [(nem 0 :kill :one)  (nem 100 :kill {"n1" :killed})
+                   (nem 1000 :start :all)
+                   {:type :info :process :nemesis :f :start :time (* 1000000 31000)
+                    :value {"n1" {:started true :port-open true :port-open-ms 30000}
+                            "n2" {:started true :port-open true :port-open-ms 28500}}}
+                   (ok 31200)])]
+    (is (= 200 (:recovered-after-ms (first (:detail r)))))
+    (is (= {:median 30000 :max 30000} (:port-open-ms r)))))
+
+;; ---------------------------------------------------------------------------
 ;; Degenerate input
 ;; ---------------------------------------------------------------------------
 

@@ -204,6 +204,55 @@
                   :timeout     120000
                   :interval    1000}))
 
+(def start-ready-timeout-ms
+  "How long a restarted node gets to open its HTTP port before the nemesis
+  stops waiting.
+
+  Kept short on purpose. Whatever the nemesis waits for here it is *not*
+  applying faults, so a long wait quietly rewrites the fault schedule — at 60 s
+  a 300 s run managed 5 nemesis windows instead of ~20. The port opens in 1-3 s
+  in practice; this only needs to cover a slow start, not a broken one."
+  15000)
+
+(defn await-up!
+  "Blocks until `node`'s HTTP port answers, up to `timeout` ms. Returns true, or
+  false on timeout — never throws, because a node that fails to come back is a
+  result the nemesis records, not an error that should abort a test whose
+  history is still worth analysing.
+
+  ## Why this is not a readiness check, and cannot be
+
+  A node answering here is NOT ready: Kahuna serves `/v1/cluster/membership`
+  with 200 about a second after launch while `IsInitialized` is still false,
+  refusing every KV request with `:must-retry` and \"node has not completed
+  cluster initialization\". It even reports `role=Voter` while in that state,
+  so the roster is no help either. Kahuna exposes no readiness signal at all;
+  that gap is filed as its own issue against the server.
+
+  Probing with a real KV request instead was tried and is worse. Whether a KV
+  request succeeds depends on the *cluster* being serviceable, not on this node
+  being initialised — so during an active partition, or while other nodes are
+  still killed, the probe fails for reasons that have nothing to do with the
+  node being started. Because the nemesis calls `start!` while other faults are
+  still in effect, waiting on that probe blocked each start for the full
+  timeout: a 300 s run went from ~20 nemesis windows to 5, none of which
+  recovered, and `:port-open-ms` came back as the timeout value itself. The
+  harness was measuring, and distorting, the fault schedule.
+
+  So this waits for the port and reports honestly what that means. Time to
+  actual readiness is not measurable from the client side until the server
+  exposes it."
+  ([node] (await-up! node start-ready-timeout-ms))
+  ([node timeout]
+   (try+
+     (util/await-fn (fn [] (or (up? node)
+                               (throw (RuntimeException. "not up yet"))))
+                    {:log-message (str "Waiting for Kahuna on " node)
+                     :timeout     timeout
+                     :interval    500})
+     true
+     (catch Object _ false))))
+
 (defn membership
   "The roster as seen by `node`: {:version long :members #{endpoint} :role str},
   or nil if the node cannot be reached.
@@ -316,8 +365,22 @@
     ;; Required by jepsen.nemesis.combined's :kill fault
     db/Process
     (start! [this test node]
-      (start! test node)
-      :started)
+      ;; Waits for the HTTP port, so the :start op's COMPLETION means "this
+      ;; node is at least listening" rather than "the daemon was spawned".
+      ;;
+      ;; :port-open-ms is named for exactly what it measures and no more. It is
+      ;; NOT time-to-ready — see `await-up!` for why that is not observable
+      ;; from here — so nothing downstream may subtract it from recovery and
+      ;; call the remainder consensus latency.
+      (let [t0    (System/nanoTime)
+            _     (start! test node)
+            open? (await-up! node)
+            ms    (long (/ (- (System/nanoTime) t0) 1e6))]
+        (when-not open?
+          (warn node "did not answer within" start-ready-timeout-ms "ms of starting"))
+        {:started      true
+         :port-open    open?
+         :port-open-ms ms}))
 
     (kill! [this test node]
       ;; Same self-kill hazard as stop!: the nemesis happily kills a node it

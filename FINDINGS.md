@@ -23,11 +23,16 @@ Not started:
       paused process keeps its connections and its leases but stops answering,
       which is the one failure mode `partition` and `kill` cannot produce.
 - [x] measure restart-to-first-successful-transaction — `kahuna.checker.recovery`
-      runs on every test and reports recovery latency plus the windows where a
-      fault landed before anything succeeded. Baseline below.
-- [ ] apply that measurement to a run that commits nothing. Those are ~1 in 10,
-      and the instrument has not yet caught one, so the original question is
-      *not* settled — see below.
+      runs on every test and reports, per fault-free window, how long until an
+      operation succeeds. Read the caveats with the numbers: it is an upper
+      bound, not a clean measurement.
+- [x] apply that measurement to a run that commits nothing. Caught one in a
+      10-run hunt. The washouts are nodes that are listening but have not
+      completed cluster initialization — mechanism below, filed against the
+      server.
+- [ ] separate initialisation time from consensus recovery. Blocked on the
+      server exposing a readiness signal; every client-side proxy tried so far
+      measured something else. See the three failed attempts below.
 
 ## Closed: "mutual exclusion violated" was a bug in *this* checker
 
@@ -450,12 +455,16 @@ killing a node mid-forward produces exactly that. Rare now — one run in the la
 chain is an HTTP/2 transport failure; bare `Internal` is also what a genuine
 server-side fault produces.
 
-## Open: runs that commit nothing
+## Mostly closed: runs that commit nothing
 
 Roughly 1 in 10 runs produces **zero** committed transactions and so yields
 `:empty-transaction-graph` — which reads like a clean result and is not one.
 **Discard these; never count them as passes.** That distinction has already
 caused one incorrect "verified fixed" conclusion in this repo.
+
+The mechanism is now known — nodes that are listening but have not finished
+initialising, refusing every request with `MustRetry` (see *"Answered"* below).
+What is still open is why initialisation takes as long as it does.
 
 Most are `:kill :all` (every node down, nothing servable). The interesting case
 is a run whose whole 90 s went:
@@ -471,50 +480,97 @@ The cluster gets 11–16 s between a restart and the next majority kill, so the
 open question is whether Kahuna can form a quorum inside that window or whether
 recovery is simply slower than the fault schedule.
 
-### Recovery baseline (healthy runs)
+### Answered: the nodes are up, and not initialised
 
-`kahuna.checker.recovery` measures this on every run. Across 7 × 300 s
-`append` / `partition,kill` runs at the default 15 s interval, all of which
-committed normally (325–1163 transactions):
+A hunt of 10 × 300 s `append` / `partition,kill` runs caught one of the
+~1-in-10 washouts, and it settles the mechanism. Run
+`store/kahuna-append-kill,partition/20260806T205010.154Z`: zero commits, and
+every failure accounted for.
 
 ```
-75 recovered windows, 7 starved
-median 3330 ms   p90 16248 ms   max 54422 ms
+1614  [:start :must-retry 200]
+1338  :connection-refused          ← client's node was killed
+  15  :timeout
+   8  :no-http-response
+   0  successful transactions
 ```
 
-**Read the failure errors before reading these numbers.** The long windows are
-dominated by `:connection-refused`, which means the server processes were not
-listening — five self-contained .NET servers booting and replaying RocksDB on a
-loaded Docker Desktop VM. That is startup cost, not consensus recovery, and it
-will differ on other hardware. These numbers characterise *this environment*
-recovering, not Kahuna resolving a leader.
+All **1614** `MustRetry` responses match 1614 occurrences in the node logs of a
+single message, character-identical every time:
 
-One window out of 75 is the interesting shape: 36 s, of which 178 failures were
-`[:start :must-retry 200]` — nodes up and answering, no leader resolvable. That
-is the same signature as the commit-nothing runs above. One window is a lead,
-not a finding.
+```
+KEYVALUE leader for partition 3 could not be resolved, returning MustRetry:
+Cannot resolve leader for partition 3: node has not completed cluster initialization
+```
 
-**The original question is still open**, and this measurement cannot close it
-as built. What would: the sub-window from *all processes listening again* to
-*first success*, which subtracts startup and leaves only consensus recovery.
-The history alone cannot see process liveness, so that needs a readiness probe
-in the nemesis `:start` path or correlation against node logs.
+with, from the same nodes:
 
-#### An earlier version of this section was wrong
+```
+JoinCluster: waiting for initialization (1005 ms elapsed): local=n1:8082 role=Voter
+systemLeader=none systemState=Active p0MaxLog=1 p0Term=1 userPartitions=0/3 initialized=false
+```
 
-It reported a median of 164 ms from a single run and concluded recovery was
-"usually immediate". The checker that produced it opened a recovery window at
-*every* fault-ending nemesis op, so under `partition,kill` it timed recovery
-from a partition heal while nodes were still killed — measuring a cluster that
-was still under attack, and attributing the result to whichever fault happened
-to end first. It also made the per-fault breakdown look meaningful when it was
-not.
+So the washouts are not a mystery and not primarily an availability problem
+either: the nodes come back, open their HTTP port in about a second, and then
+refuse everything until initialisation completes. The run contained a **22.9 s
+window with no fault active at all** that committed nothing.
 
-Fixed in `kahuna.checker.recovery`: a window now opens only when the *last*
-outstanding fault ends, and `a-window-opens-only-when-the-last-fault-ends`
-pins it. The lesson is the same one this file keeps recording — a measurement
-that fails silently is more dangerous than a checker that goes red, because
-nothing about a plausible number invites a second look.
+Filed against the server as *"No readiness signal: the API serves before
+cluster initialization completes"*. Note `role=Voter` is reported throughout
+that state, so the roster cannot be used as a readiness check either.
+
+**Why the timing question is still open.** Knowing the refusal is "still
+initialising" does not say how long initialising *should* take, or why
+`systemLeader=none` persists. That remains the question at the top of this
+section.
+
+### Recovery latency, and why it is an upper bound
+
+`kahuna.checker.recovery` reports, for every window in which no fault is
+active, how long until a client operation succeeds. A healthy 300 s
+`append` / `partition,kill` run:
+
+```
+:windows 9  :recovered 7  :never-recovered 1
+:recovery-ms  {:min 112, :median 155, :p95 3786, :max 3786}
+:port-open-ms {:median 1079, :max 1424}
+```
+
+**`:recovery-ms` is an upper bound on consensus recovery, not a measurement of
+it.** It still contains an unknown share of initialisation time, because
+nothing client-side distinguishes "listening but uninitialised" from
+"initialised but still electing" — that is the missing signal filed above.
+`:port-open-ms` is reported for context and is **not** subtractable: the port
+opens long before the node can serve.
+
+Once the server exposes readiness, this becomes a real decomposition. Until
+then, do not quote `:recovery-ms` as consensus latency.
+
+#### Three earlier versions of this measurement were wrong
+
+Recorded because the failure mode repeats and is nearly invisible — each
+version produced plausible numbers under an inaccurate label, and nothing went
+red.
+
+1. **Windows opened at every fault-ending op.** Under `partition,kill` that
+   timed "recovery" from a partition heal while nodes were still killed. It
+   reported a 164 ms median from one run, and a per-fault breakdown that looked
+   meaningful and was not. Fixed: a window opens only when the *last*
+   outstanding fault ends, pinned by
+   `a-window-opens-only-when-the-last-fault-ends`.
+2. **Readiness gated on HTTP 200.** The same `up?`-versus-`voter?` error as the
+   membership nemesis: the port answers about a second after launch, so
+   "startup" read as ~1 s while the node was still minutes from serving.
+3. **Readiness gated on a real KV probe.** Correct-sounding and worse. Whether
+   a KV request succeeds depends on the *cluster* being serviceable, not on
+   this node being initialised, and the nemesis calls `start!` while other
+   faults are still active — so each start blocked for the full 60 s timeout. A
+   300 s run fell from ~20 nemesis windows to 5, none recovered, and the
+   reported startup time was the timeout value itself. The harness was
+   rewriting the fault schedule it was supposed to be observing.
+
+The surviving rule: a nemesis that is waiting is a nemesis that is not applying
+faults, and any wait inside a fault op is a change to the experiment.
 
 ```
 Kommander.RaftException: Invalid partition: 3

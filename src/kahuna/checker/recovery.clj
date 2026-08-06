@@ -78,7 +78,9 @@
   Tagging positionally rather than by :index keeps this usable on a plain
   vector of op maps, which is what the tests pass."
   [history]
-  (->> history
+  ;; jepsen hands the checker a History; tests hand it a plain vector of op
+  ;; maps. `h/history` accepts either, and the h/* filters require it.
+  (->> (h/history history)
        (h/remove h/client-op?)
        (map-indexed (fn [i op] (assoc op ::role (if (even? i) :invoke :complete))))
        vec))
@@ -160,6 +162,26 @@
     (nth sorted (min (dec (count sorted))
                      (long (* p (count sorted)))))))
 
+(defn port-open-ms
+  "Per-node time from launch to the HTTP port answering, from the :start ops.
+
+  Reported for context only. It is emphatically NOT time-to-ready, and
+  :recovery-ms is NOT 'recovery minus this': Kahuna answers HTTP about a second
+  after launch and then refuses every KV request for as long as it takes to
+  finish initialising, with no signal a client can observe. So an unknown and
+  possibly dominant share of every :recovery-ms figure below is a node that was
+  listening but not yet initialised, and this number does not bound it.
+
+  Making that separation real needs a readiness signal from the server. Filed
+  against Kahuna; until it exists, treat :recovery-ms as an upper bound on
+  consensus recovery and nothing more precise."
+  [history]
+  (->> (nemesis-ops history)
+       (filter #(and (= :complete (::role %)) (= :start (:f %))))
+       (mapcat (fn [op] (let [v (:value op)] (when (map? v) (vals v)))))
+       (keep #(when (map? %) (:port-open-ms %)))
+       sort))
+
 (defn checker
   "A jepsen checker reporting recovery latency. Always :valid? true — see the
   namespace docstring."
@@ -169,6 +191,7 @@
       (let [ws        (windows history)
             recovered (filter :recovered? ws)
             latencies (sort (keep :recovered-after-ms recovered))
+            boots     (port-open-ms history)
             ;; Only windows closed by a *new fault* count as failures to
             ;; recover. One closed by the end of the history is censored: the
             ;; test simply stopped watching.
@@ -189,4 +212,9 @@
                                :max    (last latencies)})
 
           (seq starved)
-          (assoc :starved-window-ms (sort (keep :window-ms starved))))))))
+          (assoc :starved-window-ms (sort (keep :window-ms starved)))
+
+          ;; Context only — not subtractable from :recovery-ms. See port-open-ms.
+          (seq boots)
+          (assoc :port-open-ms {:median (percentile boots 0.5)
+                                :max    (last boots)}))))))
