@@ -57,7 +57,7 @@ reach for:
 | Flag | Meaning |
 |---|---|
 | `--workload` | `register`, `lock`, `append` or `sequencer` |
-| `--faults` | comma-separated `partition,kill,pause,clock`, or `all` |
+| `--faults` | comma-separated `partition,kill,pause,membership,clock`, or `all` |
 | `--concurrency` | total client threads; **must** be an exact multiple of `--concurrency-per-key` |
 | `--rate` | requests/sec per client |
 | `--time-limit` | seconds of load |
@@ -111,6 +111,7 @@ are never touched, so a pruned run is still fully re-analyzable.
 | `src/kahuna/workload/lock.clj` | mutual exclusion + fencing tokens over distributed locks |
 | `src/kahuna/workload/append.clj` | Elle list-append over interactive transactions |
 | `src/kahuna/workload/sequencer.clj` | duplicate-free id allocation across leader changes |
+| `src/kahuna/nemesis/membership.clj` | removes a node from the Raft roster and rejoins it |
 | `src/kahuna/core.clj` | test map, nemesis wiring, CLI |
 | `test/` | negative controls proving the lock and sequencer checkers can actually fail |
 | `docker/` | 5 Jepsen nodes + a control node |
@@ -120,7 +121,8 @@ are never touched, so a pruned run is still fully re-analyzable.
 
 `.github/workflows/jepsen.yml` runs nightly (04:00 UTC) and on manual dispatch,
 as a matrix over workloads and fault sets — `register` under `partition`,
-`kill` and `partition,kill`; `lock` and `append` under `partition` and
+`kill`, `partition,kill` and `pause`; `lock` under `partition`,
+`partition,kill` and `pause`; `append` and `sequencer` under `partition` and
 `partition,kill`. It is deliberately not a per-PR gate
 ([why](DESIGN.md#why-ci-is-not-a-per-pr-gate)).
 

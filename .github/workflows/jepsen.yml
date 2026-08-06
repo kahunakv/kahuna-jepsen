@@ -88,6 +88,30 @@ jobs:
             faults: partition,kill
             concurrency: 5
             ops_per_key: 60
+          # Every client hammers ONE sequence, so ops-per-key/concurrency-per-key
+          # are inert here — the workload does not use jepsen.independent. They
+          # are still passed because the run step always renders them.
+          - workload: sequencer
+            faults: partition
+            concurrency: 10
+            ops_per_key: 60
+          - workload: sequencer
+            faults: partition,kill
+            concurrency: 10
+            ops_per_key: 60
+          # `pause` (SIGSTOP) is the fault the other jobs cannot simulate: the
+          # process keeps its TCP connections and its leases but stops answering,
+          # so peers see a live-but-mute node rather than a refused connection or
+          # a severed link. For `lock` that is the sharpest lease test there is —
+          # a paused holder cannot renew and cannot notice it lost the lock.
+          - workload: lock
+            faults: pause
+            concurrency: 10
+            ops_per_key: 60
+          - workload: register
+            faults: pause
+            concurrency: 9
+            ops_per_key: 60
 
     env:
       KAHUNA_REPO: ${{ inputs.kahuna_repo || 'kahunakv/kahuna' }}

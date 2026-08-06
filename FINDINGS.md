@@ -9,13 +9,21 @@ For *why* the tests are shaped the way they are, see [DESIGN.md](DESIGN.md).
 | `register` | linearizable CAS register (Knossos) | green; found a stale-read violation, since fixed and verified |
 | `lock` | mutual exclusion + fencing-token monotonicity, lease-aware | green as of Kommander 1.0.10; found a fencing rollback (fixed, 16/16 verified) and a checker bug that faked exclusion violations |
 | `append` | Elle list-append over interactive transactions | found four real bugs; three fixed (write skew closed on absence, 29 runs), HTTP 500 all but fixed |
-| `sequencer` | no id handed out twice; allocation-range integrity; idempotent replay | new; found an HTTP 500 on the redirect path before a nemesis was even enabled |
+| `sequencer` | no id handed out twice; allocation-range integrity; idempotent replay | new; found an HTTP 500 on the redirect path before a nemesis was even enabled. Now in the nightly matrix under `partition` and `partition,kill` |
 
 Not started:
 
-- [ ] membership nemesis using `/v1/cluster/membership` (add/remove node)
+- [x] membership nemesis — a node leaves the roster and rejoins, verified
+      against the committed roster on every operation. **Not** via
+      `/v1/cluster/membership`, which is GET-only: membership is driven by
+      `--join-existing` and `--graceful-leave-on-shutdown`. See
+      `src/kahuna/nemesis/membership.clj`.
 - [ ] snapshot-read workload exercising `readTimestamp` + snapshot holds
-- [ ] `pause` fault in the CI matrix (supported by the harness, not yet wired in)
+- [x] `pause` fault in the CI matrix — wired in for `lock` and `register`. A
+      paused process keeps its connections and its leases but stops answering,
+      which is the one failure mode `partition` and `kill` cannot produce.
+- [ ] measure restart-to-first-successful-transaction, to settle whether the
+      commit-nothing runs below are slow recovery or no recovery
 
 ## Closed: "mutual exclusion violated" was a bug in *this* checker
 
@@ -496,6 +504,30 @@ up in full in the closed exclusion section above.
 nothing committed and Elle reported `:empty-transaction-graph`. Every
 transaction-scoped request must carry *both* a coordinator key and a non-zero
 operation id — see [DESIGN.md](DESIGN.md#transactions).
+
+**A membership nemesis that changed no membership.** Two independent causes,
+both of which produced `Everything looks good!` on a register run while the
+roster sat unchanged at version 1 the whole time:
+
+* The first `:leave` fired 3 s into the test, while the target was still logging
+  `JoinCluster: waiting for initialization ... systemLeader=none
+  initialized=false`. Jepsen's readiness check was `up?`, which only asks
+  whether HTTP answers — true within a second of boot, and long before the node
+  is a committed Voter. With no leader there was no one to commit the
+  `RemoveMember`, so the node simply died.
+* Then, once that was gated, every leave still failed: the harness SIGKILLed the
+  departing node 20 s after SIGTERM, but Kahuna sets no
+  `HostOptions.ShutdownTimeout` so .NET's 30 s default applies, and
+  `ReplicationService.StopAsync` spends up to 10 s of it inside `LeaveCluster`.
+  The leave was being truncated every time. At 45 s the same code removed a node
+  on the first attempt.
+
+Both looked exactly like a server-side "graceful leave doesn't work" bug, and
+the second one is the more instructive: the evidence *for* the wrong conclusion
+was a node log that ended at `Application is shutting down...` with no leave
+recorded — which is equally consistent with a SIGKILL discarding .NET's buffered
+console output. Every `:leave` now reports the roster size before and after,
+from a surviving node, as `:removed` in the history.
 
 **A slingshot selector applied to non-maps.** `(contains? % :kahuna/abort)` was
 evaluated against every thrown object, including the `SocketTimeoutException`s

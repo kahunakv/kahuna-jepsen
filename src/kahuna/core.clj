@@ -11,6 +11,7 @@
             [jepsen.os.debian :as debian]
             [kahuna.client :as kc]
             [kahuna.db :as kdb]
+            [kahuna.nemesis.membership :as membership]
             [kahuna.workload.append :as append]
             [kahuna.workload.lock :as lock]
             [kahuna.workload.register :as register]
@@ -28,7 +29,7 @@
   whole VM. Enable :clock only on a disposable Linux host — but do enable it
   there, because Kahuna's MVCC and lease logic ride on an HLC and that is where
   the interesting bugs live."
-  #{:partition :kill :pause})
+  #{:partition :kill :pause :membership})
 
 (defn parse-faults [s]
   (if (= s "all")
@@ -42,14 +43,21 @@
         workload    (workload-fn opts)
         faults      (:faults opts all-faults)
         db          (kdb/db (:tarball opts))
-        nemesis     (nc/nemesis-package
-                      {:db        db
-                       :nodes     (:nodes opts)
-                       :faults    faults
-                       :partition {:targets [:one :majority :majorities-ring]}
-                       :kill      {:targets [:one :majority :all]}
-                       :pause     {:targets [:one :majority]}
-                       :interval  (:nemesis-interval opts 15)})]
+        nemesis-opts {:db        db
+                      :nodes     (:nodes opts)
+                      :faults    faults
+                      :partition {:targets [:one :majority :majorities-ring]}
+                      :kill      {:targets [:one :majority :all]}
+                      :pause     {:targets [:one :majority]}
+                      :interval  (:nemesis-interval opts 15)
+                      :membership-interval (:membership-interval opts 30)}
+        ;; :membership is ours, not jepsen.nemesis.combined's — it would ignore
+        ;; the fault silently and the test would run with no membership churn
+        ;; at all, which is exactly the kind of quiet no-op that reads as a
+        ;; clean pass. Composed in explicitly instead.
+        nemesis     (nc/compose-packages
+                      (conj (nc/nemesis-packages nemesis-opts)
+                            (membership/package nemesis-opts)))]
     (merge tests/noop-test
            opts
            {:name       (str "kahuna-" (name (:workload opts))
@@ -89,6 +97,16 @@
 
    [nil "--nemesis-interval SECONDS" "Seconds between nemesis operations"
     :default 15
+    :parse-fn read-string
+    :validate [pos? "must be positive"]]
+
+   [nil "--membership-interval SECONDS" "Seconds between membership operations.
+                                        Longer than --nemesis-interval on
+                                        purpose: a leave waits for the departing
+                                        node to commit its own removal, and a
+                                        join waits for a Learner to catch up and
+                                        be promoted."
+    :default 30
     :parse-fn read-string
     :validate [pos? "must be positive"]]
 
