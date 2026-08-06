@@ -22,8 +22,12 @@ Not started:
 - [x] `pause` fault in the CI matrix — wired in for `lock` and `register`. A
       paused process keeps its connections and its leases but stops answering,
       which is the one failure mode `partition` and `kill` cannot produce.
-- [ ] measure restart-to-first-successful-transaction, to settle whether the
-      commit-nothing runs below are slow recovery or no recovery
+- [x] measure restart-to-first-successful-transaction — `kahuna.checker.recovery`
+      runs on every test and reports recovery latency plus the windows where a
+      fault landed before anything succeeded. Baseline below.
+- [ ] apply that measurement to a run that commits nothing. Those are ~1 in 10,
+      and the instrument has not yet caught one, so the original question is
+      *not* settled — see below.
 
 ## Closed: "mutual exclusion violated" was a bug in *this* checker
 
@@ -465,8 +469,39 @@ is a run whose whole 90 s went:
 with no `:kill :all` at all — just repeated `:kill :majority` plus partitions.
 The cluster gets 11–16 s between a restart and the next majority kill, so the
 open question is whether Kahuna can form a quorum inside that window or whether
-recovery is simply slower than the fault schedule. Measuring
-restart-to-first-successful-transaction directly would settle it.
+recovery is simply slower than the fault schedule.
+
+### Recovery baseline (healthy runs)
+
+`kahuna.checker.recovery` now measures this on every run. From a 300 s
+`append` / `partition,kill` run at the default 15 s interval — a **healthy**
+one, 1163 committed transactions:
+
+```
+:windows 24  :recovered 15  :never-recovered 6
+:recovery-ms {:min 3, :median 164, :p95 10622, :max 10622}
+:starved-window-ms (249 2377 2751 6623 7498 11299)
+```
+
+Two things follow, and a third does not.
+
+* **Recovery is usually immediate.** A median of 164 ms says that when the
+  cluster is left alone it is serving again almost at once. The blunt version of
+  hypothesis (2) — "recovery is always slower than the fault schedule" — is not
+  supported.
+* **But the tail reaches the fault interval.** The slowest recovery was 10.6 s,
+  against a 15 s interval. There is not much headroom, and one window went
+  11.3 s with nothing succeeding.
+* **This does not explain the commit-nothing runs.** Four of the six starved
+  windows were shorter than 3 s — the nemesis simply hit again quickly, which
+  says nothing about how fast the cluster *could* have recovered. And this run
+  committed plenty, so it is a baseline for the healthy case, not a measurement
+  of the pathological one.
+
+**The original question is therefore still open.** What is needed is this
+measurement on a run that commits nothing. Every run now carries it, so it is a
+matter of collecting append runs until one of the ~1-in-10 appears and reading
+its `:recovery` map. Do not treat the baseline above as the answer.
 
 ```
 Kommander.RaftException: Invalid partition: 3

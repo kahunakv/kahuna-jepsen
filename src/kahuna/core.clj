@@ -9,6 +9,7 @@
                     [tests :as tests]]
             [jepsen.nemesis.combined :as nc]
             [jepsen.os.debian :as debian]
+            [kahuna.checker.recovery :as recovery]
             [kahuna.client :as kc]
             [kahuna.db :as kdb]
             [kahuna.nemesis.membership :as membership]
@@ -70,6 +71,10 @@
                           {:perf     (checker/perf {:nemeses (:perf nemesis)})
                            :stats    (checker/stats)
                            :exceptions (checker/unhandled-exceptions)
+                           ;; Measurement, not a property: always :valid? true.
+                           ;; Present on every run so a history that commits
+                           ;; nothing carries its own explanation.
+                           :recovery (recovery/checker)
                            :workload (:checker workload)})
             :generator  (gen/phases
                           (->> (:generator workload)

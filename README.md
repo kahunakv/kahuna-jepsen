@@ -112,6 +112,7 @@ are never touched, so a pruned run is still fully re-analyzable.
 | `src/kahuna/workload/append.clj` | Elle list-append over interactive transactions |
 | `src/kahuna/workload/sequencer.clj` | duplicate-free id allocation across leader changes |
 | `src/kahuna/nemesis/membership.clj` | removes a node from the Raft roster and rejoins it |
+| `src/kahuna/checker/recovery.clj` | how long after a fault ends until a request succeeds |
 | `src/kahuna/core.clj` | test map, nemesis wiring, CLI |
 | `test/` | negative controls proving the lock and sequencer checkers can actually fail |
 | `docker/` | 5 Jepsen nodes + a control node |
