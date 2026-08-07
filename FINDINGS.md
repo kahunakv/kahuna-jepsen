@@ -30,9 +30,10 @@ Not started:
       10-run hunt. The washouts are nodes that are listening but have not
       completed cluster initialization — mechanism below, filed against the
       server.
-- [ ] separate initialisation time from consensus recovery. Blocked on the
-      server exposing a readiness signal; every client-side proxy tried so far
-      measured something else. See the three failed attempts below.
+- [x] separate initialisation time from consensus recovery — unblocked by
+      `GET /v1/cluster/health` on the server, sampled by
+      `kahuna.nemesis.health` and split by the recovery checker into
+      `:init-ms` / `:consensus-ms`.
 
 ## Closed: "mutual exclusion violated" was a bug in *this* checker
 
@@ -516,35 +517,68 @@ refuse everything until initialisation completes. The run contained a **22.9 s
 window with no fault active at all** that committed nothing.
 
 Filed against the server as *"No readiness signal: the API serves before
-cluster initialization completes"*. Note `role=Voter` is reported throughout
-that state, so the roster cannot be used as a readiness check either.
+cluster initialization completes"*, and **since fixed**: `GET
+/v1/cluster/health` now reports `{ready, initialized, localRole}` with 200/503,
+and `initialized` was added to the membership response. Confirmed against a
+live node mid-initialisation:
+
+```
+{"ready":false,"initialized":false,"localRole":"Voter"}  [HTTP 503]
+```
+
+Note the `role=Voter` in that state — the roster never was a usable readiness
+check, which is why the flag has to gate first.
 
 **Why the timing question is still open.** Knowing the refusal is "still
 initialising" does not say how long initialising *should* take, or why
 `systemLeader=none` persists. That remains the question at the top of this
 section.
 
-### Recovery latency, and why it is an upper bound
+### Recovery latency, split into initialisation and consensus
 
-`kahuna.checker.recovery` reports, for every window in which no fault is
-active, how long until a client operation succeeds. A healthy 300 s
-`append` / `partition,kill` run:
+Kahuna now exposes `GET /v1/cluster/health` — `{ready, initialized, localRole}`,
+200 when the node can serve and 503 while it cannot. `kahuna.nemesis.health`
+samples it on a timer and records `{node → ready?}` into the history;
+`kahuna.checker.recovery` uses those samples to split each fault-free window at
+the moment every node reported ready.
+
+A 300 s `append` / `partition,kill` run at `--health-interval 0.5`:
 
 ```
-:windows 9  :recovered 7  :never-recovered 1
-:recovery-ms  {:min 112, :median 155, :p95 3786, :max 3786}
-:port-open-ms {:median 1079, :max 1424}
+:windows 12  :recovered 7  :never-recovered 4
+:recovery-ms  {:min 26, :median 1428, :p95 3270, :max 3270}
+:init-ms      {:median 17,   :max 377}     ← waiting for every node ready
+:consensus-ms {:median 2546, :max 3253}    ← from all-ready to first success
 ```
 
-**`:recovery-ms` is an upper bound on consensus recovery, not a measurement of
-it.** It still contains an unknown share of initialisation time, because
-nothing client-side distinguishes "listening but uninitialised" from
-"initialised but still electing" — that is the missing signal filed above.
-`:port-open-ms` is reported for context and is **not** subtractable: the port
-opens long before the node can serve.
+Unlike `:port-open-ms`, these two **do** sum to `:recovery-ms` within a window,
+and a test asserts it.
 
-Once the server exposes readiness, this becomes a real decomposition. Until
-then, do not quote `:recovery-ms` as consensus latency.
+**In healthy windows, initialisation is not the cost — consensus is.** With
+every node already back, readiness is essentially instant (17 ms median) and
+the remaining ~2.5 s is the cluster resolving a leader before it will serve.
+That does not contradict the washout finding above: those runs are the other
+regime, where initialisation never completes at all.
+
+#### Sample the readiness signal, never wait on it
+
+Readiness is not node-local — `IsInitialized` needs the partition map from the
+P0 leader, so a node cannot become ready while a partition or majority kill is
+in force. Waiting for it inside a nemesis op therefore waits out unrelated
+faults, and jepsen runs one nemesis process, so a nemesis that is waiting is a
+nemesis that is not applying faults. Sampling observes the same transition
+without touching the experiment; verified by comparing fault counts across
+sampling rates (kill 22 vs 20, start 48 vs 38 at 0.5 s vs 2 s).
+
+#### The sample interval bounds what you can conclude
+
+At the 2 s default, only 1 of 3 recovered windows contained a sample, and that
+one reported `init-ms 2194 / consensus-ms 2205` — a tidy 50/50 split that was
+pure sampling artifact. At 0.5 s, 6 of 7 windows decomposed and initialisation
+turned out to be two orders of magnitude smaller. A window shorter than the
+interval cannot be split at all, and one barely longer is mostly quantisation
+error. Lower `--health-interval` before quoting a number, and check how many
+windows actually carry `:init-ms` before believing the median.
 
 #### Three earlier versions of this measurement were wrong
 

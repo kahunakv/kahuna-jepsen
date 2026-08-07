@@ -214,34 +214,37 @@
   in practice; this only needs to cover a slow start, not a broken one."
   15000)
 
+(defn ready?
+  "Can `node` serve requests? Reads /v1/cluster/health.
+
+  This is the signal the harness spent three wrong attempts approximating:
+  `up?` answers a second after launch and means only 'listening'; a real KV
+  probe conflates this node being initialised with the whole cluster being
+  serviceable. The server now reports it directly — initialization complete
+  *and* a serving role in the roster."
+  [node]
+  (try+
+    (true? (:ready (kc/cluster-health node)))
+    (catch Object _ false)))
+
 (defn await-up!
   "Blocks until `node`'s HTTP port answers, up to `timeout` ms. Returns true, or
   false on timeout — never throws, because a node that fails to come back is a
   result the nemesis records, not an error that should abort a test whose
   history is still worth analysing.
 
-  ## Why this is not a readiness check, and cannot be
+  Note this waits for the port, NOT for readiness, even though `ready?` now
+  exists. Readiness depends on the cluster: `IsInitialized` requires the
+  partition map from the P0 leader, so a node cannot become ready while a
+  partition or a majority kill is still in force. Since the nemesis calls
+  `start!` with other faults still active, waiting for readiness here would
+  block each start until those cleared — which is exactly what happened when
+  this waited on a KV probe: a 300 s run fell from ~20 nemesis windows to 5,
+  none recovered. A nemesis that is waiting is a nemesis that is not applying
+  faults.
 
-  A node answering here is NOT ready: Kahuna serves `/v1/cluster/membership`
-  with 200 about a second after launch while `IsInitialized` is still false,
-  refusing every KV request with `:must-retry` and \"node has not completed
-  cluster initialization\". It even reports `role=Voter` while in that state,
-  so the roster is no help either. Kahuna exposes no readiness signal at all;
-  that gap is filed as its own issue against the server.
-
-  Probing with a real KV request instead was tried and is worse. Whether a KV
-  request succeeds depends on the *cluster* being serviceable, not on this node
-  being initialised — so during an active partition, or while other nodes are
-  still killed, the probe fails for reasons that have nothing to do with the
-  node being started. Because the nemesis calls `start!` while other faults are
-  still in effect, waiting on that probe blocked each start for the full
-  timeout: a 300 s run went from ~20 nemesis windows to 5, none of which
-  recovered, and `:port-open-ms` came back as the timeout value itself. The
-  harness was measuring, and distorting, the fault schedule.
-
-  So this waits for the port and reports honestly what that means. Time to
-  actual readiness is not measurable from the client side until the server
-  exposes it."
+  Readiness is instead *sampled* — see `kahuna.nemesis.health` — so it is
+  observed without being waited on."
   ([node] (await-up! node start-ready-timeout-ms))
   ([node timeout]
    (try+

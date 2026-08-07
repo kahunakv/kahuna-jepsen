@@ -361,3 +361,18 @@
   cluster has actually formed before a test starts."
   [node]
   (get! node "/v1/cluster/membership" {:timeout 2000}))
+
+(defn cluster-health
+  "Reads /v1/cluster/health: {:ready bool :initialized bool :localRole str}.
+
+  The status code carries the same answer as the body — 200 ready, 503 not —
+  and `get!` does not throw on either, so callers read :ready rather than
+  inspecting :status.
+
+  This is the signal that distinguishes 'listening' from 'able to serve'. A
+  node answers /v1/cluster/membership about a second after launch and then
+  refuses every key/value request until initialization completes; before this
+  endpoint existed there was no way to tell those apart without sending a real
+  request and being refused."
+  [node]
+  (get! node "/v1/cluster/health" {:timeout 2000}))

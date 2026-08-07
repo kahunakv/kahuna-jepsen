@@ -177,6 +177,48 @@
     (is (= {:median 30000 :max 30000} (:port-open-ms r)))))
 
 ;; ---------------------------------------------------------------------------
+;; Splitting recovery into initialisation and consensus
+;; ---------------------------------------------------------------------------
+
+(defn health
+  "A readiness sample from kahuna.nemesis.health, as an invoke/complete pair."
+  [ms ready-map]
+  [{:type :info :process :nemesis :f :health :time (* 1000000 (dec ms)) :value nil}
+   {:type :info :process :nemesis :f :health :time (* 1000000 ms) :value ready-map}])
+
+(deftest recovery-splits-at-the-moment-every-node-is-ready
+  ;; Window opens at 1000 when the last fault ends. n2 is still initialising
+  ;; and only reports ready at 6000; the first success lands at 6500.
+  ;;
+  ;; So 5000 ms was initialisation and 500 ms was consensus. Reporting 5500 ms
+  ;; of "recovery" and calling it consensus latency is the mistake this split
+  ;; exists to prevent.
+  (let [r (check* (concat [(nem 0 :kill :one) (nem 100 :kill {"n1" :killed})
+                           (nem 900 :start :all) (nem 1000 :start {})]
+                          (health 2000 {"n1" true "n2" false})
+                          (health 4000 {"n1" true "n2" false})
+                          (health 6000 {"n1" true "n2" true})
+                          [(ok 6500)]))
+        w (first (:detail r))]
+    (is (= 5500 (:recovered-after-ms w)))
+    (is (= 5000 (:init-ms w)))
+    (is (= 500  (:consensus-ms w)))
+    ;; The two halves must account for the whole window.
+    (is (= (:recovered-after-ms w) (+ (:init-ms w) (:consensus-ms w))))))
+
+(deftest without-health-samples-there-is-no-split
+  ;; Runs with --no-health-sampling, and every history recorded before the
+  ;; server exposed /v1/cluster/health, must report the upper bound and no
+  ;; decomposition — rather than silently attributing all of it to consensus.
+  (let [r (check* [(nem 0 :kill :one) (nem 100 :kill {"n1" :killed})
+                   (nem 900 :start :all) (nem 1000 :start {})
+                   (ok 6500)])
+        w (first (:detail r))]
+    (is (= 5500 (:recovered-after-ms w)))
+    (is (nil? (:init-ms w)))
+    (is (nil? (:consensus-ms r)))))
+
+;; ---------------------------------------------------------------------------
 ;; Degenerate input
 ;; ---------------------------------------------------------------------------
 

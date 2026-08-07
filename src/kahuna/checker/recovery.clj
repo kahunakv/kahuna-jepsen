@@ -113,6 +113,12 @@
         ;; Realised once: the history may be large and we scan it repeatedly.
         oks     (vec (->> history (h/filter h/client-op?) (h/filter h/ok?)))
         nem     (nemesis-ops history)
+        ;; Readiness samples from kahuna.nemesis.health, if it was enabled.
+        healths (->> nem
+                     (filter #(and (= :complete (::role %))
+                                   (= :health (:f %))
+                                   (map? (:value %))))
+                     vec)
         ;; First :ok strictly inside (from, to). `to` nil means "to the end".
         ok-in   (fn [from to]
                   (->> oks
@@ -120,11 +126,28 @@
                        (take-while #(or (nil? to) (< (:time %) to)))
                        first
                        :time))
+        ;; First moment inside the window at which every node reported ready.
+        ;; Resolution is one sample interval — see kahuna.nemesis.health.
+        all-ready-in (fn [from to]
+                       (->> healths
+                            (drop-while #(<= (:time %) from))
+                            (take-while #(or (nil? to) (< (:time %) to)))
+                            (filter #(and (seq (:value %))
+                                          (every? true? (vals (:value %)))))
+                            first
+                            :time))
         ;; Resolves an open window against the moment it closed.
         close   (fn [opened closed-at end-tag]
                   (if-let [ok-t (ok-in opened closed-at)]
-                    {:at-ms (ms opened) :recovered? true
-                     :recovered-after-ms (ms (- ok-t opened))}
+                    (let [ready-t (all-ready-in opened ok-t)]
+                      (cond-> {:at-ms (ms opened) :recovered? true
+                               :recovered-after-ms (ms (- ok-t opened))}
+                        ;; Split the window at the moment every node reported
+                        ;; ready: before it the cluster was still initialising,
+                        ;; after it the remaining wait is consensus.
+                        ready-t
+                        (assoc :init-ms      (ms (- ready-t opened))
+                               :consensus-ms (ms (- ok-t ready-t)))))
                     (merge {:at-ms (ms opened) :recovered? false :end end-tag}
                            (when closed-at
                              {:window-ms (ms (- closed-at opened))}))))
@@ -217,4 +240,16 @@
           ;; Context only — not subtractable from :recovery-ms. See port-open-ms.
           (seq boots)
           (assoc :port-open-ms {:median (percentile boots 0.5)
-                                :max    (last boots)}))))))
+                                :max    (last boots)})
+
+          ;; The decomposition, available only when health sampling ran. These
+          ;; DO sum to :recovery-ms, unlike :port-open-ms: :init-ms is the wait
+          ;; for every node to report ready, :consensus-ms is what the cluster
+          ;; spent after that before serving a request.
+          (seq (keep :init-ms recovered))
+          (assoc :init-ms
+                 (let [v (sort (keep :init-ms recovered))]
+                   {:median (percentile v 0.5) :max (last v)})
+                 :consensus-ms
+                 (let [v (sort (keep :consensus-ms recovered))]
+                   {:median (percentile v 0.5) :max (last v)})))))))

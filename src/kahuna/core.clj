@@ -12,6 +12,7 @@
             [kahuna.checker.recovery :as recovery]
             [kahuna.client :as kc]
             [kahuna.db :as kdb]
+            [kahuna.nemesis.health :as health]
             [kahuna.nemesis.membership :as membership]
             [kahuna.workload.append :as append]
             [kahuna.workload.lock :as lock]
@@ -51,14 +52,25 @@
                       :kill      {:targets [:one :majority :all]}
                       :pause     {:targets [:one :majority]}
                       :interval  (:nemesis-interval opts 15)
-                      :membership-interval (:membership-interval opts 30)}
+                      :membership-interval (:membership-interval opts 30)
+                      ;; `get` with a default, not `(:health-sampling opts)`:
+                      ;; the key is present-and-nil unless --no-health-sampling
+                      ;; assoc'd it, and a nil value defeats the package's own
+                      ;; default, silently disabling sampling.
+                      :health-sampling (get opts :health-sampling true)
+                      :health-interval (:health-interval opts 2)}
         ;; :membership is ours, not jepsen.nemesis.combined's — it would ignore
         ;; the fault silently and the test would run with no membership churn
         ;; at all, which is exactly the kind of quiet no-op that reads as a
         ;; clean pass. Composed in explicitly instead.
         nemesis     (nc/compose-packages
                       (conj (nc/nemesis-packages nemesis-opts)
-                            (membership/package nemesis-opts)))]
+                            (membership/package nemesis-opts)
+                            ;; Not a fault — it samples readiness so recovery
+                            ;; latency can be split into initialisation and
+                            ;; consensus. Composed here so its samples share the
+                            ;; nemesis process and land in the same history.
+                            (health/package nemesis-opts)))]
     (merge tests/noop-test
            opts
            {:name       (str "kahuna-" (name (:workload opts))
@@ -104,6 +116,20 @@
     :default 15
     :parse-fn read-string
     :validate [pos? "must be positive"]]
+
+   [nil "--health-interval SECONDS" "Seconds between readiness samples. Bounds
+                                    the resolution of the :init-ms /
+                                    :consensus-ms split in the recovery
+                                    checker."
+    :default 2
+    :parse-fn read-string
+    :validate [pos? "must be positive"]]
+
+   [nil "--no-health-sampling" "Stop sampling /v1/cluster/health. Recovery
+                               latency is then reported as an upper bound only,
+                               with no initialisation/consensus split."
+    :default false
+    :assoc-fn (fn [m _ _] (assoc m :health-sampling false))]
 
    [nil "--membership-interval SECONDS" "Seconds between membership operations.
                                         Longer than --nemesis-interval on
