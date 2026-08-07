@@ -85,6 +85,18 @@
     ;; are testing that configuration on purpose. Default here is to fsync.
     (when (:disable-wal-sync-writes test)
       [:--disable-wal-sync-writes])
+    ;; Persisted MVCC revision retention. The server default is 0 — keep every
+    ;; revision forever — which means a snapshot read that misses the bounded
+    ;; in-memory archive is always rescued from disk. That makes a snapshot
+    ;; hold nearly unfalsifiable: history it failed to protect would still be
+    ;; there. Setting a finite retention (and a cleanup interval short enough
+    ;; that a sweep runs during the test, rather than the 300 s default that a
+    ;; 300 s run never reaches) is what turns reclamation into a real force for
+    ;; the floor to hold back. See src/kahuna/workload/snapshot.clj.
+    (when-let [n (:revision-retention test)]
+      (when (pos? n) [:--persistent-revision-retention-count n]))
+    (when-let [s (:revision-cleanup-interval test)]
+      [:--persistent-revision-cleanup-interval s])
     ;; Safe to set unconditionally alongside the other faults: it only fires
     ;; from StopAsync, which a SIGKILL never reaches. The :kill fault therefore
     ;; still models a crash, not a polite departure.

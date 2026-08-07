@@ -10,6 +10,7 @@ For *why* the tests are shaped the way they are, see [DESIGN.md](DESIGN.md).
 | `lock` | mutual exclusion + fencing-token monotonicity, lease-aware | green as of Kommander 1.0.10; found a fencing rollback (fixed, 16/16 verified) and a checker bug that faked exclusion violations |
 | `append` | Elle list-append over interactive transactions | found four real bugs; three fixed (write skew closed on absence, 29 runs), HTTP 500 all but fixed |
 | `sequencer` | no id handed out twice; allocation-range integrity; idempotent replay | new; found an HTTP 500 on the redirect path before a nemesis was even enabled. Now in the nightly matrix under `partition` and `partition,kill` |
+| `snapshot` | a pinned snapshot never changes its answer | new; green under `partition` and `partition,kill`. Found two wire-contract bugs — a routed read returning no commit timestamp (which silently degraded an as-of read to a latest read) and a floor response that could not express a refusal — both fixed and verified |
 
 Not started:
 
@@ -18,7 +19,9 @@ Not started:
       `/v1/cluster/membership`, which is GET-only: membership is driven by
       `--join-existing` and `--graceful-leave-on-shutdown`. See
       `src/kahuna/nemesis/membership.clj`.
-- [ ] snapshot-read workload exercising `readTimestamp` + snapshot holds
+- [x] snapshot-read workload exercising `readTimestamp` + snapshot holds — see
+      `src/kahuna/workload/snapshot.clj`. Green under `partition` and
+      `partition,kill`; the routed-read finding below came out of building it.
 - [x] `pause` fault in the CI matrix — wired in for `lock` and `register`. A
       paused process keeps its connections and its leases but stops answering,
       which is the one failure mode `partition` and `kill` cannot produce.
@@ -630,6 +633,119 @@ grep -oE "\[:start nil [0-9]+\]" store/kahuna-append-*/latest/jepsen.log | sort 
 The workload records the HTTP status in its `[:start …]` error for exactly this
 reason — a nil response type is otherwise undiagnosable from the history.
 
+## Closed: a routed read lost its commit timestamp
+
+*Filed against the server; fixed in `2e006ad` and verified.*
+
+**A `try-get` served by a node that does not own the key comes back with
+`lastModified` of zero.** The value and revision are correct; the timestamp,
+the last-used time and the state are all zeroed.
+
+`Kahuna.Shared` documents `lastModified` as the field callers round-trip into a
+later snapshot read:
+
+> When the entry was last written. Callers round-trip this into a later
+> snapshot read, so it must carry the real commit time rather than a
+> placeholder.
+
+**Why it is worse than a missing field.** Zero is not a neutral value in this
+API — `HLCTimestamp.Zero` is the *read the latest committed value* sentinel for
+`readTimestamp`. A client that follows the documented round-trip therefore does
+not get an error, or an old value, or a rejection. It gets a **latest read
+wearing the shape of a snapshot read**, on every request that happened to be
+routed, with nothing anywhere to indicate the snapshot was ignored. Anything
+built on as-of reads — point-in-time restore, consistent backup, repeatable
+analytics scans — is silently reading the present instead of the past whenever
+it talks to a non-owning node.
+
+**The mechanism.** `KeyValuesService.TryGetKeyValueInternal` builds the gRPC
+response for the inter-node hop and assigns only `Revision` and the three
+`Expires*` fields:
+
+```csharp
+GrpcTryGetKeyValueResponse response = new()
+{
+    ServedFrom = "", Type = (GrpcKeyValueResponseType)type,
+    Revision = keyValueContext.Revision,
+    ExpiresNode = ..., ExpiresPhysical = ..., ExpiresCounter = ...,
+    TimeElapsedMs = ...
+};
+```
+
+`LastModified{Node,Physical,Counter}`, `LastUsed*` and `State` are declared in
+`keyvalues.proto` and *are* read back by
+`GrpcInterNodeCommunication.TryGetValue`, so they arrive as protobuf defaults —
+zero, and `KeyValueState.Undefined`. The REST handler on the contacted node
+then faithfully forwards those zeros. Local reads are unaffected, which is why
+this survives a single-node test.
+
+**Evidence.** In a 45 s five-node run, every successful pin came from one node
+(n5, four different keys) and every `:no-timestamp` failure came from n1, n2 or
+n4 — a per-node split, not a per-key one, which is the signature of routing
+rather than of anything key-specific. The workload refuses to pin on a zero
+timestamp, so this shows up as pin failures rather than as silently vacuous
+snapshot reads; that guard is the only reason the workload does not quietly
+verify nothing. See `:no-timestamp` in `src/kahuna/workload/snapshot.clj`.
+
+### Fixed — the signature reversed
+
+`TryGetKeyValueInternal` (and its `try-exists` sibling) now assign `LastUsed*`,
+`LastModified*` and `State`. Verified on a 120 s `partition` run:
+
+| | before | after |
+|---|---|---|
+| `:no-timestamp` pin failures | 28 of 55 | **0** |
+| nodes serving successful pins | n5 only | n1 27, n2 23, n3 19, n4 15, n5 19 |
+| holds / protected reads | 53 / 147 | **103 / 284** |
+
+The node distribution is the part worth keeping. The bug's whole signature was
+that pins concentrated on a single node; the fix's signature is that they spread
+evenly across all five. That is a prediction the fix could have failed, rather
+than an absence of errors that a dozen unrelated things could explain.
+
+The property itself still holds afterwards — 183 of 284 protected reads served
+from below head, max depth 14, no stability, leakage, provenance or floor
+violations — and again under `partition,kill`.
+
+## Closed: `/v1/kv/snapshot-floor` answered 200 with a body it could not express
+
+*Filed against the server; fixed in `2e006ad` and verified.*
+
+When the floor read fails retryably — typically on a node that is not the
+meta-partition leader and cannot reach it — `RetryableExceptionMapping`
+rewrites the response body to the key/value surface's generic
+`{"type":101}` (MustRetry) and leaves the status at **200**.
+
+`KahunaGetSnapshotFloorResponse` has no `type` field, so a client that reads
+the documented shape sees `effectiveFloor` and `liveHolds` simply absent. The
+obvious client-side reading of "no `liveHolds`" is *zero live holds* — the
+exact opposite of the truth, which is that nothing was measured. A checker that
+believed it would report the floor as empty while holds were live.
+
+The harness treats a floor response without a numeric `liveHolds` as a failed
+observation rather than a zero, and classifies a `type` of `:must-retry`
+accordingly. The general shape is worth remembering: **a middleware that
+normalises errors across a family of endpoints will produce bodies that some of
+those endpoints' own contracts cannot represent.**
+
+### Fixed
+
+`KahunaGetSnapshotFloorResponse` now carries a `type` (`Get` on success), so a
+substituted MustRetry deserializes into a legal instance and a refusal is
+distinguishable from an empty success. The same audit added `type` to the other
+`/v1/kv/` responses that lacked one — set-many, delete-many and many-values —
+which is the more valuable half of the fix: those had the same latent trap and
+none of them had been observed failing yet.
+
+Verified on the same 120 s run: 131 floor reads ok, 8 `:info` (a genuine
+MustRetry under partition, now correctly classified as indeterminate rather than
+as a malformed response), none unreadable. Before the fix one node returned 9 of
+9 unusable bodies.
+
+The harness now checks the type *and* the count rather than inferring reachability
+from whether `liveHolds` was present — the contract states it outright now, so
+there is no reason to keep guessing from a field's absence.
+
 ## Harness bugs worth remembering
 
 All of these produced verdicts that looked like server findings.
@@ -666,6 +782,29 @@ was a node log that ended at `Application is shutting down...` with no leave
 recorded — which is equally consistent with a SIGKILL discarding .NET's buffered
 console output. Every `:leave` now reports the roster size before and after,
 from a surviving node, as `:removed` in the history.
+
+**A snapshot workload that could have verified nothing.** The first green
+snapshot runs reported 69 protected reads and no violations. They were also
+compatible with every one of those reads having been served by the key's
+*current* revision — a read as of T needs no history at all while T is still
+the newest version, so the hold, the floor and the retention policy would never
+have been touched. The checker now computes how far below head each protected
+read was served and returns `:unknown` when none of them reached retained
+history. The distinction is visible in the numbers: with reclamation left at
+its default (keep every revision forever) the property is nearly unfalsifiable,
+because history the floor failed to protect would still be on disk; with
+`--revision-retention 4` the same workload read at depths up to 12, which only
+the floor could have kept alive.
+
+**`(zero? nil)` crashed a checker on a malformed observation.** `get-in`'s
+default only fires when a key is *absent*, and the floor client had assoc'd
+`:live-holds nil` — present and nil — so the default never applied and the
+checker died with a `NullPointerException` mid-analysis. The same
+present-and-nil-versus-absent distinction had already cost this suite a
+silently-disabled health sampler. Comparisons in a checker should use `= 0`
+rather than `zero?` for exactly this reason: a checker that crashes on
+malformed input tells you less than one that ignores it, and both are better
+than one that reads it as a real observation.
 
 **A slingshot selector applied to non-maps.** `(contains? % :kahuna/abort)` was
 evaluated against every thrown object, including the `SocketTimeoutException`s

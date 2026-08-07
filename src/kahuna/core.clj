@@ -17,13 +17,15 @@
             [kahuna.workload.append :as append]
             [kahuna.workload.lock :as lock]
             [kahuna.workload.register :as register]
-            [kahuna.workload.sequencer :as sequencer]))
+            [kahuna.workload.sequencer :as sequencer]
+            [kahuna.workload.snapshot :as snapshot]))
 
 (def workloads
   {:register  register/workload
    :lock      lock/workload
    :append    append/workload
-   :sequencer sequencer/workload})
+   :sequencer sequencer/workload
+   :snapshot  snapshot/workload})
 
 (def all-faults
   "Clock faults are NOT in the default set on purpose: settimeofday inside a
@@ -210,6 +212,31 @@
                               more expensive; 100-200 is the practical ceiling."
     :default 100
     :parse-fn read-string]
+
+   [nil "--revision-retention COUNT" "Persisted MVCC revisions to keep per key
+                                     (0 = the server default, keep forever).
+                                     Set this to give the snapshot workload
+                                     something to hold back: with unlimited
+                                     retention a snapshot hold cannot be shown
+                                     to have failed, because history it did not
+                                     protect survives on disk anyway."
+    :parse-fn read-string
+    :validate [(complement neg?) "must be non-negative"]]
+
+   [nil "--revision-cleanup-interval SECONDS" "Minimum gap between persistent
+                                              revision cleanup sweeps. The
+                                              server default is 300 s, which a
+                                              300 s run may never reach."
+    :parse-fn read-string
+    :validate [pos? "must be positive"]]
+
+   [nil "--snapshot-lease-ms MS" "Snapshot-hold lease (snapshot workload).
+                                 Defaults to the time limit plus 300 s, so a
+                                 lapsed lease never truncates the protection
+                                 windows the checker reasons over. Lower it
+                                 only to test lease expiry on purpose."
+    :parse-fn read-string
+    :validate [pos? "must be positive"]]
 
    [nil "--sequence-name NAME" "Sequence hammered by the sequencer workload.
                                One sequence on purpose: all traffic lands on a

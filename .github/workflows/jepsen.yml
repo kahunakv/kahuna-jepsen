@@ -99,6 +99,32 @@ jobs:
             faults: partition,kill
             concurrency: 10
             ops_per_key: 60
+          # The snapshot workload needs `revision_retention` set, and it is the
+          # whole point of the job: at the server default (keep every revision
+          # forever) a snapshot hold cannot be shown to have failed, because
+          # history it did not protect is still readable from disk. Retention 4
+          # with a 10 s cleanup sweep makes reclamation a real force — the
+          # default 300 s sweep interval would not fire inside the run at all.
+          #
+          # The longer budget buys protected reads: the checker returns
+          # :unknown below 25 of them, and pins are scarce while a routed read
+          # returns no commit timestamp to pin at (see FINDINGS.md). A 180 s
+          # partition,kill run cleared the floor locally with 59, but not by
+          # much, and a 4-vCPU runner is slower.
+          - workload: snapshot
+            faults: partition
+            concurrency: 10
+            ops_per_key: 60
+            time_limit: 300
+            revision_retention: 4
+            revision_cleanup_interval: 10
+          - workload: snapshot
+            faults: partition,kill
+            concurrency: 10
+            ops_per_key: 60
+            time_limit: 300
+            revision_retention: 4
+            revision_cleanup_interval: 10
           # `pause` (SIGSTOP) is the fault the other jobs cannot simulate: the
           # process keeps its TCP connections and its leases but stops answering,
           # so peers see a live-but-mute node rather than a refused connection or
@@ -232,6 +258,8 @@ jobs:
             --ops-per-key ${{ matrix.ops_per_key }} \
             --nemesis-interval ${{ matrix.nemesis_interval || 15 }} \
             --membership-interval ${{ matrix.membership_interval || 60 }} \
+            --revision-retention ${{ matrix.revision_retention || 0 }} \
+            --revision-cleanup-interval ${{ matrix.revision_cleanup_interval || 300 }} \
             --tarball target/kahuna.tar.gz
 
       - name: Collect server logs

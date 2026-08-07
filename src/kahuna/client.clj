@@ -38,6 +38,34 @@
   "HLCTimestamp.Zero — 'no transaction' / 'read the latest committed value'."
   {:n 0 :l 0 :c 0})
 
+(defn hlc-compare
+  "Total order on HLC timestamps: physical time, then counter, then node id.
+
+  Mirrors Kommander's `HLCTimestamp.CompareTo` component for component,
+  including the node-id tie-break. Getting this wrong would be quiet: nearly
+  every pair of timestamps differs in `:l` already, so a comparator that
+  ignored `:c` would agree with this one on almost all inputs and disagree
+  exactly on the same-millisecond pairs a snapshot test is built to examine.
+
+  Missing components read as 0, so `hlc-zero` and a nil-free partial map both
+  order sensibly."
+  [a b]
+  (let [c (compare (long (:l a 0)) (long (:l b 0)))]
+    (if-not (zero? c)
+      c
+      (let [c (compare (long (:c a 0)) (long (:c b 0)))]
+        (if-not (zero? c)
+          c
+          (compare (long (:n a 0)) (long (:n b 0))))))))
+
+(defn hlc-zero?
+  "Is this HLCTimestamp.Zero? Zero is the 'read latest' sentinel, so a snapshot
+  read must never be issued with one — it would silently become an ordinary
+  read of the current value and every stability check would pass vacuously."
+  [t]
+  (or (nil? t)
+      (= 0 (:n t 0) (:l t 0) (:c t 0))))
+
 ;; KeyValueFlags (Kahuna.Shared/KeyValue/KeyValueFlags.cs)
 (def flag-set                     1)
 (def flag-set-no-revision         2)
@@ -179,23 +207,36 @@
 ;; ---------------------------------------------------------------------------
 
 (defn kv-get
-  "Reads the latest committed value of `key`. Returns
-  {:type kw :value str-or-nil :revision long}."
-  [node key {:keys [durability timeout] :or {durability persistent}}]
+  "Reads `key`. Returns
+  {:type kw :value str-or-nil :revision long :last-modified hlc}.
+
+  `:read-timestamp` selects MVCC snapshot visibility: the server serves the
+  revision at-or-before it. It defaults to `hlc-zero`, which is the 'latest
+  committed value' sentinel rather than a very old snapshot.
+
+  `:last-modified` is the commit timestamp of the revision actually served, and
+  Kahuna documents it as round-trippable — it is the only way a client obtains
+  a real HLC to read as-of later. Two consequences the snapshot workload leans
+  on: reading at latest yields a timestamp naming *this* value, and a snapshot
+  read whose `:last-modified` exceeds the requested `:read-timestamp` has
+  served a revision from the future of its own snapshot."
+  [node key {:keys [durability timeout read-timestamp]
+             :or   {durability persistent}}]
   (let [r (post! node "/v1/kv/try-get"
                  {:transactionId hlc-zero
                   :key           key
                   :revision      -1
-                  :readTimestamp hlc-zero
+                  :readTimestamp (or read-timestamp hlc-zero)
                   ;; NOTE: KahunaGetKeyValueRequest tags Durability with
                   ;; [JsonPropertyName("value")] — that is not a typo here.
                   :value         durability}
                  {:timeout timeout})
         t (kv-response-type (:type r))]
-    {:type     t
-     :value    (b64->str (:value r))
-     :revision (:revision r)
-     :raw      r}))
+    {:type          t
+     :value         (b64->str (:value r))
+     :revision      (:revision r)
+     :last-modified (:lastModified r)
+     :raw           r}))
 
 (defn kv-set
   "Unconditional write. Returns {:type kw :revision long}."
@@ -354,6 +395,78 @@
     {:type       (sequence-response-type (:type r))
      :allocation (allocation r)
      :served-from (:servedFrom r)
+     :raw        r}))
+
+;; ---------------------------------------------------------------------------
+;; MVCC snapshot holds (used by the snapshot workload; see
+;; src/kahuna/workload/snapshot.clj)
+;; ---------------------------------------------------------------------------
+
+(defn snapshot-hold-acquire!
+  "Pins every revision at-or-after `timestamp` against reclamation, for
+  `lease-ms`. Returns {:type kw :hold-id str :lease-expiry hlc}.
+
+  Success is `:set` — the same overloaded name `start-tx-session` uses.
+
+  `:must-retry` here is emphatically NOT 'the hold exists, try later for the
+  id'. `SnapshotFloorStore.AcquireAsync` fails closed when a prune-delete
+  window overlapped the acquire: the hold *is* committed and durable, but the
+  boundary revision it was meant to protect may already have been deleted, so
+  the server refuses to claim the timestamp is readable. Treating that as a
+  successful pin would let the workload assert stability over history the
+  server never promised to keep, and the resulting 'violation' would be the
+  test's fault. Only `:set` may become a pin.
+
+  `holder-id` should be unique per pin: acquire is idempotent by
+  (holderId, timestamp), so two pins sharing a holder at the same timestamp
+  collapse into one hold, and releasing either drops the protection both
+  believe they hold."
+  [node holder-id timestamp lease-ms {:keys [timeout]}]
+  (let [r (post! node "/v1/kv/snapshot-hold/acquire"
+                 {:holderId  holder-id
+                  :timestamp timestamp
+                  :leaseMs   lease-ms}
+                 {:timeout timeout})]
+    {:type         (kv-response-type (:type r))
+     :hold-id      (:holdId r)
+     :lease-expiry (:leaseExpiry r)
+     :raw          r}))
+
+(defn snapshot-hold-renew!
+  "Extends a hold's lease by `lease-ms` from now. `:does-not-exist` means the
+  hold was never registered *or* had already expired — the server does not
+  distinguish, so a renewal that comes back with it cannot be read as proof the
+  protection was continuous."
+  [node hold-id lease-ms {:keys [timeout]}]
+  (let [r (post! node "/v1/kv/snapshot-hold/renew"
+                 {:holdId hold-id :leaseMs lease-ms}
+                 {:timeout timeout})]
+    {:type (kv-response-type (:type r)) :lease-expiry (:leaseExpiry r) :raw r}))
+
+(defn snapshot-hold-release!
+  "Drops a hold. The effective floor rises when the lowest one goes."
+  [node hold-id {:keys [timeout]}]
+  (let [r (post! node "/v1/kv/snapshot-hold/release"
+                 {:holdId hold-id}
+                 {:timeout timeout})]
+    {:type (kv-response-type (:type r)) :raw r}))
+
+(defn snapshot-floor
+  "Reads /v1/kv/snapshot-floor: {:floor hlc :live-holds int}. The floor is the
+  minimum timestamp among live holds, and `hlc-zero` when there are none."
+  [node {:keys [timeout]}]
+  (let [r (get! node "/v1/kv/snapshot-floor" {:timeout (or timeout 5000)})]
+    {:floor      (:effectiveFloor r)
+     :live-holds (:liveHolds r)
+     ;; `:get` on success. The type matters because
+     ;; `RetryableExceptionMapping` catches retryable infrastructure exceptions
+     ;; on /v1/kv/* and substitutes a KeyValue-shaped {"type":101} — MustRetry
+     ;; — while leaving the status at 200. Callers must not read the resulting
+     ;; absent `liveHolds` as "no holds are live"; it means nothing was
+     ;; measured at all. The field was added to this DTO for exactly that
+     ;; reason, so a refusal is now distinguishable from an empty success.
+     :type       (kv-response-type (:type r))
+     :status     (:status r)
      :raw        r}))
 
 (defn cluster-membership

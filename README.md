@@ -6,7 +6,7 @@ Jepsen tests for [Kahuna](https://github.com/kahunakv/kahuna) — a distributed
 lock manager, key/value store and sequencer built on Raft (Kommander) with
 MVCC and 2PC transactions.
 
-Four workloads run against a 5-node cluster while a nemesis partitions,
+Five workloads run against a 5-node cluster while a nemesis partitions,
 kills and pauses nodes:
 
 | Workload | What it checks |
@@ -15,6 +15,7 @@ kills and pauses nodes:
 | `lock` | mutual exclusion + fencing-token monotonicity, lease-aware |
 | `append` | serializability of interactive transactions (Elle list-append) |
 | `sequencer` | no id handed out twice, allocation-range integrity, idempotent replay |
+| `snapshot` | a pinned MVCC snapshot never changes its answer |
 
 - **[DESIGN.md](DESIGN.md)** — why the tests are shaped this way, and the limits
   you will hit. Read it before trusting or dismissing a red result.
@@ -56,12 +57,13 @@ reach for:
 
 | Flag | Meaning |
 |---|---|
-| `--workload` | `register`, `lock`, `append` or `sequencer` |
+| `--workload` | `register`, `lock`, `append`, `sequencer` or `snapshot` |
 | `--faults` | comma-separated `partition,kill,pause,membership,clock`, or `all` |
 | `--concurrency` | total client threads; **must** be an exact multiple of `--concurrency-per-key` |
 | `--rate` | requests/sec per client |
 | `--time-limit` | seconds of load |
 | `--ephemeral` | use `Ephemeral` durability instead of `Persistent` |
+| `--revision-retention` | persisted MVCC revisions kept per key. Leave it at the server default (keep forever) and the `snapshot` workload cannot fail: history a hold failed to protect would still be on disk |
 
 Run `lein test` for the unit tests — negative controls proving the lock and
 sequencer checkers actually reject real violations.
@@ -84,6 +86,11 @@ A run ends with a verdict map and either `Everything looks good!` or
 - `:insufficient-data` (sequencer) — fewer than 25 allocations were observed, so
   "no duplicates" is vacuous. The checker returns `:valid? :unknown` rather than
   success; a run where every operation failed must not read as a clean run.
+- `:insufficient-data` (snapshot) — either fewer than 25 reads landed inside a
+  proven protection window, or every one of them was served by the key's
+  current revision and so never touched retained history. Both are vacuous
+  passes; check `:reads-below-head` and `:max-depth` before believing a green
+  snapshot run.
 
 Everything from a run lands in `store/<test>/<timestamp>/` — history, verdict,
 timeline HTML, latency plots and per-node server logs.
@@ -111,6 +118,7 @@ are never touched, so a pruned run is still fully re-analyzable.
 | `src/kahuna/workload/lock.clj` | mutual exclusion + fencing tokens over distributed locks |
 | `src/kahuna/workload/append.clj` | Elle list-append over interactive transactions |
 | `src/kahuna/workload/sequencer.clj` | duplicate-free id allocation across leader changes |
+| `src/kahuna/workload/snapshot.clj` | MVCC snapshot reads pinned by snapshot holds |
 | `src/kahuna/nemesis/membership.clj` | removes a node from the Raft roster and rejoins it |
 | `src/kahuna/nemesis/health.clj` | samples `/v1/cluster/health` so recovery can be decomposed |
 | `src/kahuna/checker/recovery.clj` | how long after a fault ends until a request succeeds, split into initialisation and consensus |
@@ -125,9 +133,10 @@ are never touched, so a pruned run is still fully re-analyzable.
 as a matrix over workloads and fault sets — `register` under `partition`,
 `kill`, `partition,kill` and `pause`; `lock` under `partition`,
 `partition,kill` and `pause`; `append` and `sequencer` under `partition` and
-`partition,kill`; and `register` under `membership`, which runs longer (900s)
-because a single leave/join cycle costs a minute or two. It is deliberately not
-a per-PR gate
+`partition,kill`; `snapshot` under `partition` and `partition,kill` with
+revision retention turned down so reclamation actually happens; and `register`
+under `membership`, which runs longer (900s) because a single leave/join cycle
+costs a minute or two. It is deliberately not a per-PR gate
 ([why](DESIGN.md#why-ci-is-not-a-per-pr-gate)).
 
 Differences from a local run:
