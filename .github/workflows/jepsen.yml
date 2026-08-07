@@ -111,6 +111,14 @@ jobs:
           # returns no commit timestamp to pin at (see FINDINGS.md). A 180 s
           # partition,kill run cleared the floor locally with 59, but not by
           # much, and a 4-vCPU runner is slower.
+          #
+          # The `partition` job is the one carrying the signal; it is what found
+          # the floor-boundary rewind (fixed in kahuna 65fcc70) with 64 violating
+          # reads of 681 protected. `partition,kill` is marginal at this budget:
+          # it clears the checker's 25-protected-read floor by single digits when
+          # it clears it at all, and one local run washed out entirely at 15
+          # holds. Read :valid? :unknown from that job as the config being too
+          # harsh to conclude anything, not as a regression -- see FINDINGS.md.
           - workload: snapshot
             faults: partition
             concurrency: 10

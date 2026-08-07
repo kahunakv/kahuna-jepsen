@@ -10,7 +10,7 @@ For *why* the tests are shaped the way they are, see [DESIGN.md](DESIGN.md).
 | `lock` | mutual exclusion + fencing-token monotonicity, lease-aware | green as of Kommander 1.0.10; found a fencing rollback (fixed, 16/16 verified) and a checker bug that faked exclusion violations |
 | `append` | Elle list-append over interactive transactions | found four real bugs; three fixed (write skew closed on absence, 29 runs), HTTP 500 all but fixed |
 | `sequencer` | no id handed out twice; allocation-range integrity; idempotent replay | new; found an HTTP 500 on the redirect path before a nemesis was even enabled. Now in the nightly matrix under `partition` and `partition,kill` |
-| `snapshot` | a pinned snapshot never changes its answer | new; green under `partition` and `partition,kill`. Found two wire-contract bugs — a routed read returning no commit timestamp (which silently degraded an as-of read to a latest read) and a floor response that could not express a refusal — both fixed and verified |
+| `snapshot` | a pinned snapshot never changes its answer | green again as of `65fcc70`. Its first nightly found the bug it was written for: with two or more concurrent holds, every hold but the oldest rewound to the oldest one's revision (64 violating reads locally, and it needed no fault at all). Also found two wire-contract bugs while being built — a routed read returning no commit timestamp, and a floor response that could not express a refusal. Four server findings, all fixed and verified |
 
 Not started:
 
@@ -20,8 +20,9 @@ Not started:
       `--join-existing` and `--graceful-leave-on-shutdown`. See
       `src/kahuna/nemesis/membership.clj`.
 - [x] snapshot-read workload exercising `readTimestamp` + snapshot holds — see
-      `src/kahuna/workload/snapshot.clj`. Green under `partition` and
-      `partition,kill`; the routed-read finding below came out of building it.
+      `src/kahuna/workload/snapshot.clj`. Two wire-contract findings came out of
+      building it; the first nightly run then found a real snapshot violation
+      (holds collapsing onto the floor boundary). All fixed and verified.
 - [x] `pause` fault in the CI matrix — wired in for `lock` and `register`. A
       paused process keeps its connections and its leases but stops answering,
       which is the one failure mode `partition` and `kill` cannot produce.
@@ -745,6 +746,222 @@ as a malformed response), none unreadable. Before the fix one node returned 9 of
 The harness now checks the type *and* the count rather than inferring reachability
 from whether `liveHolds` was present — the contract states it outright now, so
 there is no reason to keep guessing from a field's absence.
+
+## Closed: a held snapshot silently rewound to the floor-boundary revision
+
+*Found by the first nightly `snapshot / partition` run (2026-08-07), reproduced
+locally on the same commit. Filed against the server; fixed in `65fcc70` and
+verified.*
+
+**A read as of T, under a live hold at T, stops returning the value at T and
+starts returning the oldest surviving revision instead — the one pinned by the
+cluster-wide floor.** The answer changes mid-run, on every node at once, and
+never changes back while the hold lives.
+
+One hold from the nightly, in full:
+
+```
+05:31:52.305  :pin   key 4, t=L1786080708415, value "v960", revision 48   (n5)
+05:31:53.761  :read  → "v960" rev 48                                     (n2)
+05:32:02.161  :read  → "v960" rev 48                                     (n3)
+05:32:05.423  :renew ok, lease-expiry L1786081325418
+05:32:05.922  :read  → "v129" rev 5, lastModified L1786080640263         (n1)
+05:32:07.971  :read  → "v129" rev 5                                      (n2)
+... same answer from n1, n2, n3, n4 and n5 until the release at 05:32:26
+```
+
+The hold was renewed 500 ms before the flip and released 20 s after it, so no
+lease lapsed; the read went backwards 43 revisions while the client held the
+snapshot open and the server kept confirming the hold.
+
+**The `lastModified` of the wrong answer is the tell.** In the local
+reproduction it is `{:n 2, :l 1786114418220, :c 4}` — *bit-for-bit the effective
+floor* the same run reported from `/v1/kv/snapshot-floor`:
+
+```
+:ok :floor {:floor {:n 2, :l 1786114418220, :c 4}, :live-holds 14, :node "n2"}
+:ok :read  {... :value "v26", :revision 1, :last-modified {:n 2, :l 1786114418220, :c 4}}
+```
+
+The read did not return a random old version, or a version at the reader's own
+timestamp. It returned **the floor-boundary revision**: the newest revision at
+or before the *minimum* live hold in the cluster. Every hold above the minimum
+collapses onto it.
+
+**The mechanism.** `BaseHandler.RemoveExpiredRevisions` trims the in-memory
+revision archive to the newest `RevisionRetention` entries, and exempts exactly
+one older revision — the floor boundary — so that a read at the floor
+timestamp still hits memory. The in-memory archive is therefore **not a
+contiguous newest-N suffix**: it is `{boundary} ∪ {newest N}`, with a hole
+between them.
+
+`TryGetHandler` then does this:
+
+```csharp
+if (!entry.TryGetRevisionAtOrBefore(message.ReadTimestamp, out long snapRevision, out var snapshot))
+{
+    // In-memory archive trimmed the as-of revision; fall back to the persisted
+    // revision history. This is correct because trimming drops the lowest revision
+    // numbers, so an in-memory miss means the true as-of answer (if any) is older
+    // and only on disk.
+    ...GetKeyValueRevisionAtOrBefore(...)
+}
+```
+
+The comment states the invariant the code depends on — *trimming drops the
+lowest revision numbers* — and the boundary exemption is precisely what breaks
+it. `TryGetRevisionAtOrBefore` returns the highest **in-memory** revision at or
+before the snapshot, which for any T landing in the hole is the boundary. It
+returns `true`, so the disk fallback never runs.
+
+The disk was innocent throughout: `SqlitePersistenceBackend.PruneKeyRevisions`
+takes the floor and deletes only `revision < floorRevision`, so the correct
+revision 48 was sitting on disk the entire time. Nothing was lost. The read
+simply stopped asking.
+
+The same `TryGetRevisionAtOrBefore`-then-fall-back-on-false shape appears in
+`TryExistsHandler`, `TryGetByRangeHandler` and `BucketScanContinuation`, so
+point reads are unlikely to be the only affected path.
+
+**Why the server's own guards stayed silent.** Two of them are pointed at the
+adjacent question. `SnapshotFloorMetrics.MissingProtectedVersion` fires when a
+trim *drops* the boundary; here the boundary is faithfully kept and then handed
+out for timestamps it does not answer for. And
+`TestSnapshotFloorPinEndToEnd` reads at `t1` — the floor timestamp itself,
+where the boundary *is* the right answer — and asserts the disk fallback was
+**not** called (`Assert.Equal(0, callsAfter - callsBefore)`), which is the exact
+behaviour that makes the hole unreachable. No existing test reads at a
+timestamp *above* the floor whose revision has been trimmed, which is the entire
+bug.
+
+**Scope.** A single-hold deployment cannot see this: with one hold the floor is
+that hold, T is the boundary, and the boundary answer is correct. It needs two
+or more concurrent holds at different timestamps — then every hold except the
+oldest reads the oldest one's data. That is the ordinary case for anything that
+takes overlapping consistent snapshots: concurrent backups, a long analytics
+scan next to a PITR cut, two readers on different cursors.
+
+**Evidence.**
+
+| | nightly CI (`partition`, 300 s) | local repro (same config) | local, **no faults**, 180 s |
+|---|---|---|---|
+| fault windows | 10 | 10 | **0** |
+| holds | 202 | 257 | 157 |
+| protected reads | 578 | 681 | 387 |
+| violating reads | ≥10 (checker caps the list) | **64**, over 16 holds and all 5 keys | **2**, over 2 holds |
+| max read depth | 160 | 219 | 135 |
+| leakage / provenance | clean | clean | clean |
+
+**No fault is required.** The third column is a run with the nemesis producing
+nothing at all (`:windows 0`), and it still fails. That follows from the
+mechanism — a retention trim and a read are the only moving parts — and it makes
+the bug far cheaper to reproduce than the nightly config suggests. Faults only
+amplify it: a partition delays releases, so more holds sit open at once and the
+gap between each hold and the cluster floor grows.
+
+Leakage clean matters too: the wrong answers are all at or before the reader's
+snapshot, so nothing here is a visibility violation the server would notice
+internally. It is a *stale* snapshot, not a leaking one, which is why it can run
+for a whole nightly without a single error in the server logs.
+
+### Fixed — the hole is now declared rather than assumed away
+
+`KeyValueEntry` gained two fields the trim path maintains: `FloorBoundaryRevision`
+(which revision is pinned below the contiguous window) and
+`FloorBoundaryCoverageEnd` (the earliest `LastModified` ever trimmed *above* the
+boundary). `TryGetRevisionAtOrBefore` now reports a miss when the only candidate
+is the boundary and the snapshot falls at or after that bound, so the caller
+takes the disk path it was always supposed to take.
+
+The shape of the fix is the part worth keeping. The old code carried the
+invariant in a comment — *trimming drops the lowest revision numbers* — while a
+different function quietly broke it. The new code makes the discontinuity a
+value the entry carries, so the read path can ask instead of assume.
+
+Verified on both configurations that failed:
+
+| | `partition`, 300 s | no faults, 180 s |
+|---|---|---|
+| violating reads | 64 → **0** | 2 → **0** |
+| protected reads | 681 → 652 | 387 → 486 |
+| reads below head | — → 476 | — → 444 |
+| max read depth | 219 → 44 | 135 → 55 |
+
+Holds (215, 169) and protected reads are in line with the failing runs, so this
+is not a pass bought by measuring less. **Max depth falling is the fix, not a
+loss of coverage**: the enormous depths before were themselves the bug — reads
+being answered with revision 0–5 while head sat near 220. What remains is
+ordinary snapshot depth, still below head for 476 and 444 reads respectively.
+
+A `partition,kill` run also passed, but thinly — 30 protected reads against a
+threshold of 25, 9 below head. An earlier attempt at the same config washed out
+entirely (15 holds, `:valid? :unknown`, pins failing on `:must-retry` and
+connection-refused). That fault set does not reliably produce enough protected
+reads at 300 s to verify anything; treat `:unknown` from that CI job as the
+expected outcome rather than a regression, and read the `partition` job as the
+one carrying the signal.
+
+## Closed: `/v1/kv/snapshot-floor` reported zero live holds while holds were live
+
+*Observed twice in the same nightly run; not reproduced locally. Filed against
+the server; fixed in `65fcc70`.*
+
+`GetSnapshotFloor` is documented to answer from the meta-partition leader —
+`AmILeader` / `WaitForLeader`, otherwise route. Twice in the nightly, two nodes
+gave contradictory answers a fraction of a second apart, with no fault active
+and all five nodes reporting healthy:
+
+```
+05:30:37.465  :floor {:floor {:l 1786080635983}, :live-holds 2, :node "n1"}
+05:30:37.574  :floor {:floor {:l 0},             :live-holds 0, :node "n4"}   ← 109 ms later
+...
+05:30:41.968  :floor {:floor {:l 0},             :live-holds 0, :node "n3"}
+05:30:42.220  :floor {:floor {:l 1786080635983}, :live-holds 3, :node "n5"}   ← 252 ms later
+```
+
+The checker only asserts the zero case — "none at all, while we provably hold
+one" — because the count is cluster-wide and "fewer than expected" has innocent
+explanations. Here the server refutes itself: n1 named the floor and the count
+while n4 said there was nothing, so no reading of the count makes both true.
+
+Either a non-leader answered from its own replica, or a node briefly believed
+itself meta-partition leader before its hold state was applied. Both come out
+the same way at the API: **zero live holds and a floor of `HLCTimestamp.Zero` —
+the value that means "reclaim anything"**. This fails open.
+
+It is worth more than a wrong number, because the retention trim does not call
+this endpoint at all: `RemoveExpiredRevisions` reads
+`context.SnapshotFloorStore` *locally*, on every node, and starts with
+`if (floorStore.Holds.Count > 0)`. A node whose hold set is empty for the same
+reason prunes as though nothing were held anywhere. The endpoint is the only
+externally visible symptom of a condition that has a much quieter internal
+consequence.
+
+Not reproduced in one 300 s local run — both zero-count reads there landed
+before any hold existed, which is legitimate. The CI runner is slower and
+elects later, which is consistent with a narrow window around meta-partition
+leadership settling.
+
+### Fixed — and the evidence is a refusal, not an absence
+
+`GetSnapshotFloor` now answers locally only under read-index leadership
+confirmation (`ConfirmLeadershipAsync`), never from local belief, and returns
+`MustRetry` when leadership cannot be confirmed or the node has not joined. It
+fails closed instead of reporting a floor of `Zero`.
+
+An absence of zero-counts would be weak evidence here, since the race never
+reproduced locally in the first place. The useful signal is the opposite one:
+under `partition`, **23 floor reads came back `:info` (MustRetry)** against 218
+successes — the new fail-closed path firing, on exactly the node states that
+previously fabricated a zero. Fault-free, where leadership is never in doubt, it
+fires once in 160. And every remaining zero-count read in both runs now lands
+*before the first pin of the run*, where zero is the truth.
+
+The harness needed no change: it already required `type == Get` **and** a numeric
+`liveHolds` before recording an observation, so a MustRetry body — which now
+carries a real `liveHolds: 0` — is still classified as "nothing was measured"
+rather than "no holds". Requiring both, rather than inferring from the count
+alone, is what makes that hold.
 
 ## Harness bugs worth remembering
 
