@@ -74,20 +74,30 @@
   A write that times out is `:info`: it may still land, and the checker treats
   every *attempted* write as a value that could legitimately be read back. A
   read that times out is `:info` too, but harmlessly — an unanswered read
-  contributes no observation at all."
-  [op & body]
+  contributes no observation at all.
+
+  `op-box` is a volatile holding the op as currently known, not a plain op. A
+  branch that has already chosen which hold it is acting on records that in the
+  box *before* making the request, so the op still names the hold when the
+  request throws. This is load-bearing for `:release`: `hold-windows` ends a
+  hold's protection window on an indeterminate release, but only when it can
+  see a `:hold-id`. Assoc'ing onto the original invocation instead dropped the
+  id on every transport-level failure, leaving the window open to the lease
+  bound — and every later `live-holds 0` inside it was reported as a floor
+  violation. That produced ten violations in a run where the server was right."
+  [op-box & body]
   `(try+
      ~@body
      (catch java.net.ConnectException e#
-       (assoc ~op :type :fail, :error :connection-refused))
+       (assoc @~op-box :type :fail, :error :connection-refused))
      (catch java.net.SocketTimeoutException e#
-       (assoc ~op :type :info, :error :timeout))
+       (assoc @~op-box :type :info, :error :timeout))
      (catch java.net.UnknownHostException e#
-       (assoc ~op :type :fail, :error :unknown-host))
+       (assoc @~op-box :type :fail, :error :unknown-host))
      (catch org.apache.http.NoHttpResponseException e#
-       (assoc ~op :type :info, :error :no-http-response))
+       (assoc @~op-box :type :info, :error :no-http-response))
      (catch java.io.IOException e#
-       (assoc ~op :type :info, :error [:io (.getMessage e#)]))))
+       (assoc @~op-box :type :info, :error [:io (.getMessage e#)]))))
 
 ;; ---------------------------------------------------------------------------
 ;; Client
@@ -118,8 +128,9 @@
   (setup! [this test])
 
   (invoke! [this test op]
-    (let [http {:timeout timeout}]
-      (with-errors op
+    (let [http   {:timeout timeout}
+          op-box (volatile! op)]
+      (with-errors op-box
         (case (:f op)
           :write
           (let [{:keys [key value]} (:value op)
@@ -224,12 +235,17 @@
             ;; Deregister first: protection ends the moment this request is
             ;; sent, so a read that started afterwards must not be asserted on.
             (do (forget-pin! pins pin)
+                ;; Into the box before the call, not onto the result after it:
+                ;; a release that throws is still a release the server may have
+                ;; performed, and the checker can only end the window for a
+                ;; hold it can name.
+                (vswap! op-box assoc :value {:hold-id (:hold-id pin)
+                                             :key (:key pin)
+                                             :t (:t pin) :node node})
                 (let [r (kc/snapshot-hold-release! node (:hold-id pin) http)]
-                  (assoc op :type (if (= :set (:type r)) :ok
-                                      (kc/response-class (:type r)))
-                            :value {:hold-id (:hold-id pin) :key (:key pin)
-                                    :t (:t pin) :node node}
-                            :error (when-not (= :set (:type r)) (:type r)))))
+                  (assoc @op-box :type (if (= :set (:type r)) :ok
+                                           (kc/response-class (:type r)))
+                                 :error (when-not (= :set (:type r)) (:type r)))))
             (assoc op :type :fail :error :no-pins))
 
           :floor

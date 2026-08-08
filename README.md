@@ -59,6 +59,7 @@ reach for:
 |---|---|
 | `--workload` | `register`, `lock`, `append`, `sequencer` or `snapshot` |
 | `--faults` | comma-separated `partition,kill,pause,membership,clock`, or `all` |
+| `--kill-targets` | what `kill` aims at: `one,minority,majority,all`. Drop `all` for the `snapshot` workload — a full-cluster kill destroys every live snapshot hold, so the run re-acquires instead of measuring |
 | `--concurrency` | total client threads; **must** be an exact multiple of `--concurrency-per-key` |
 | `--rate` | requests/sec per client |
 | `--time-limit` | seconds of load |

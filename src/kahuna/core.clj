@@ -40,6 +40,18 @@
     all-faults
     (set (map keyword (str/split s #",")))))
 
+(def kill-targets
+  "What `:kill` may aim at. jepsen.nemesis.combined also accepts :primaries,
+  which is deliberately absent from the default: Kahuna spreads leadership
+  across partitions, so \"the primaries\" is most of the cluster and the fault
+  degenerates into :all."
+  #{:one :minority :majority :all})
+
+(def default-kill-targets [:one :majority :all])
+
+(defn parse-kill-targets [s]
+  (mapv keyword (str/split s #",")))
+
 (defn kahuna-test
   "Builds a test map from CLI options."
   [opts]
@@ -51,7 +63,7 @@
                       :nodes     (:nodes opts)
                       :faults    faults
                       :partition {:targets [:one :majority :majorities-ring]}
-                      :kill      {:targets [:one :majority :all]}
+                      :kill      {:targets (:kill-targets opts default-kill-targets)}
                       :pause     {:targets [:one :majority]}
                       :interval  (:nemesis-interval opts 15)
                       :membership-interval (:membership-interval opts 30)
@@ -113,6 +125,19 @@
    [nil "--faults FAULTS" "Comma-separated nemesis faults, or 'all'"
     :default all-faults
     :parse-fn parse-faults]
+
+   [nil "--kill-targets TARGETS" "Comma-separated targets the :kill fault may
+                                 aim at: one, minority, majority, all. Drop
+                                 'all' for workloads whose state lives in the
+                                 cluster rather than in the client — a
+                                 full-cluster kill destroys every live snapshot
+                                 hold, so the workload spends the run
+                                 re-acquiring instead of measuring."
+    :default default-kill-targets
+    :parse-fn parse-kill-targets
+    :validate [#(and (seq %) (every? kill-targets %))
+               (str "must be a comma-separated subset of "
+                    (str/join ", " (map name (sort kill-targets))))]]
 
    [nil "--nemesis-interval SECONDS" "Seconds between nemesis operations"
     :default 15

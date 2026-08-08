@@ -114,11 +114,23 @@ jobs:
           #
           # The `partition` job is the one carrying the signal; it is what found
           # the floor-boundary rewind (fixed in kahuna 65fcc70) with 64 violating
-          # reads of 681 protected. `partition,kill` is marginal at this budget:
-          # it clears the checker's 25-protected-read floor by single digits when
-          # it clears it at all, and one local run washed out entirely at 15
-          # holds. Read :valid? :unknown from that job as the config being too
-          # harsh to conclude anything, not as a regression -- see FINDINGS.md.
+          # reads of 681 protected.
+          #
+          # `partition,kill` excludes the `all` kill target. A full-cluster kill
+          # destroys every live snapshot hold, and re-pinning costs a leader
+          # election plus a fresh write, so the run spends its budget
+          # re-acquiring instead of reading retained history. The 2026-08-08
+          # nightly drew `all` four times and `majority` four times in 300 s:
+          # 40% of the run had no quorum, 16% had no process listening at all,
+          # 147 of 2547 ops succeeded, and the checker returned :unknown at 20
+          # protected reads with :max-depth 1 -- not one read got deeper than a
+          # single revision below head. `one` and `majority` still take out
+          # leaders without annihilating the hold registry.
+          #
+          # Even so this job is the marginal one: it clears the checker's
+          # 25-protected-read floor by single digits when it clears it at all.
+          # Read :valid? :unknown here as the config being too harsh to conclude
+          # anything, not as a regression -- see FINDINGS.md.
           - workload: snapshot
             faults: partition
             concurrency: 10
@@ -133,6 +145,7 @@ jobs:
             time_limit: 300
             revision_retention: 4
             revision_cleanup_interval: 10
+            kill_targets: one,majority
           # `pause` (SIGSTOP) is the fault the other jobs cannot simulate: the
           # process keeps its TCP connections and its leases but stops answering,
           # so peers see a live-but-mute node rather than a refused connection or
@@ -258,6 +271,7 @@ jobs:
           lein with-profile +ci run test \
             --workload ${{ matrix.workload }} \
             --faults ${{ matrix.faults }} \
+            --kill-targets ${{ matrix.kill_targets || 'one,majority,all' }} \
             --nodes n1,n2,n3,n4,n5 \
             --time-limit ${{ matrix.time_limit || env.TIME_LIMIT }} \
             --rate "$RATE" \

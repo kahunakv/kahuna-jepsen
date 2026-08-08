@@ -9,6 +9,7 @@
   behaviour into a red run on every test that ran long enough."
   (:require [clojure.test :refer :all]
             [jepsen.checker :as checker]
+            [jepsen.client :as client]
             [kahuna.client :as kc]
             [kahuna.workload.snapshot :as snap]))
 
@@ -325,6 +326,51 @@
                         [(invoke 0 :release 10 nil)
                          {:type :ok :f :release :process 0 :time (ms 11)
                           :value {:hold-id "h1"}}
+                         (invoke 1 :floor 20)
+                         {:type :ok :f :floor :process 1 :time (ms 21)
+                          :value {:floor kc/hlc-zero :live-holds 0 :node "n1"}}])
+        r (check* (snap/floor-checker lease-ms margin-ms) history)]
+    (is (true? (:valid? r)))))
+
+;; ---------------------------------------------------------------------------
+;; Client — the ops the checkers above are handed must be producible
+;; ---------------------------------------------------------------------------
+
+(deftest a-release-that-throws-still-names-the-hold
+  ;; `an-indeterminate-release-still-ends-protection` and
+  ;; `an-empty-registry-after-release-is-legal` both hand-write a release op
+  ;; carrying a :hold-id, and both pass whether or not the client can actually
+  ;; produce one. It could not: `with-errors` assoc'd onto the *invocation*,
+  ;; whose value is nil, so every release that failed at the transport layer
+  ;; arrived at the checker anonymous. `hold-windows` then left the window open
+  ;; to the lease bound and the floor checker reported ten violations against a
+  ;; server that had done nothing wrong.
+  ;;
+  ;; The gap was between two things that were each individually tested, which
+  ;; is where this class of bug lives. Assert the seam.
+  (let [pins   (atom {0 [{:hold-id "h1" :key 0 :t (hlc 100) :value "v1"}]})
+        client (snap/->SnapshotClient "n1" lease-ms 1000 pins)]
+    (with-redefs [kc/snapshot-hold-release!
+                  (fn [& _] (throw (java.net.SocketTimeoutException. "read timed out")))]
+      (let [op (client/invoke! client test-map (invoke 0 :release 10))]
+        (is (= :info (:type op)))
+        (is (= :timeout (:error op)))
+        (is (= "h1" (get-in op [:value :hold-id]))
+            "an indeterminate release the checker cannot name is invisible to it")))
+    (is (empty? (get @pins 0))
+        "the pin is deregistered even when the request never completes")))
+
+(deftest a-release-that-throws-ends-the-protection-window
+  ;; The same op, end to end: what the client emits must actually close the
+  ;; window in the checker that consumes it.
+  (let [pins   (atom {0 [{:hold-id "h1" :key 0 :t (hlc 100) :value "v1"}]})
+        client (snap/->SnapshotClient "n1" lease-ms 1000 pins)
+        rel    (with-redefs [kc/snapshot-hold-release!
+                             (fn [& _] (throw (java.net.SocketTimeoutException. "x")))]
+                 (client/invoke! client test-map (invoke 0 :release 10)))
+        history (concat (pinned)
+                        [(invoke 0 :release 10)
+                         (assoc rel :time (ms 11))
                          (invoke 1 :floor 20)
                          {:type :ok :f :floor :process 1 :time (ms 21)
                           :value {:floor kc/hlc-zero :live-holds 0 :node "n1"}}])

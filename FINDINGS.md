@@ -10,7 +10,7 @@ For *why* the tests are shaped the way they are, see [DESIGN.md](DESIGN.md).
 | `lock` | mutual exclusion + fencing-token monotonicity, lease-aware | green as of Kommander 1.0.10; found a fencing rollback (fixed, 16/16 verified) and a checker bug that faked exclusion violations |
 | `append` | Elle list-append over interactive transactions | found four real bugs; three fixed (write skew closed on absence, 29 runs), HTTP 500 all but fixed |
 | `sequencer` | no id handed out twice; allocation-range integrity; idempotent replay | new; found an HTTP 500 on the redirect path before a nemesis was even enabled. Now in the nightly matrix under `partition` and `partition,kill` |
-| `snapshot` | a pinned snapshot never changes its answer | green again as of `65fcc70`. Its first nightly found the bug it was written for: with two or more concurrent holds, every hold but the oldest rewound to the oldest one's revision (64 violating reads locally, and it needed no fault at all). Also found two wire-contract bugs while being built — a routed read returning no commit timestamp, and a floor response that could not express a refusal. Four server findings, all fixed and verified |
+| `snapshot` | a pinned snapshot never changes its answer | green again as of `65fcc70`. Its first nightly found the bug it was written for: with two or more concurrent holds, every hold but the oldest rewound to the oldest one's revision (64 violating reads locally, and it needed no fault at all). Also found two wire-contract bugs while being built — a routed read returning no commit timestamp, and a floor response that could not express a refusal. Five server findings, all fixed and verified — the fifth being 287 unclassifiable responses per run when an inter-node gRPC stream died |
 
 Not started:
 
@@ -896,10 +896,42 @@ ordinary snapshot depth, still below head for 476 and 444 reads respectively.
 A `partition,kill` run also passed, but thinly — 30 protected reads against a
 threshold of 25, 9 below head. An earlier attempt at the same config washed out
 entirely (15 holds, `:valid? :unknown`, pins failing on `:must-retry` and
-connection-refused). That fault set does not reliably produce enough protected
-reads at 300 s to verify anything; treat `:unknown` from that CI job as the
-expected outcome rather than a regression, and read the `partition` job as the
-one carrying the signal.
+connection-refused). Read the `partition` job as the one carrying the signal.
+
+### Why `partition,kill` kept washing out: `:kill :all`
+
+The 2026-08-08 nightly returned `:unknown` at 20 protected reads with
+`:max-depth 1` — not one read in 300 s got deeper than a single revision below
+head. The cause was the kill target mix, not the budget. `nemesis-packages`
+drew from `[:one :majority :all]` and landed `all` four times and `majority`
+four times in eleven kill events:
+
+| | healthy nodes | share of run |
+|---|---|---|
+| all five | 5 | 44% |
+| no quorum | 2 | 24% |
+| nothing listening | 0 | 16% |
+
+147 of 2547 operations succeeded. `:recovery` agreed — 13 windows, 8 never
+recovered, `:starved-window-ms (0 0 0 55 211 974 4694 6952)`: the nemesis
+re-fires before the cluster is usable, because a full restart costs ~2.4 s to
+open the port and another ~2.2 s to reach consensus out of a 15 s interval.
+
+A full-cluster kill is a legitimate fault for `register` or `lock`, whose state
+is the client's. It is self-defeating here: it destroys every live hold, and
+re-pinning costs a leader election plus a fresh write, so the run spends its
+budget re-acquiring instead of reading retained history. `--kill-targets` now
+exists for this; the CI job passes `one,majority`. On the same 300 s config that
+took the run from `:unknown` (20 protected reads, max depth 1) to `:valid? true`
+(30 protected reads, 26 holds, 14 below head, max depth 3), with recovery at
+9 of 11 windows instead of 4 of 13.
+
+Two honest caveats. One run is one run, and 30 against a threshold of 25 is
+still thin — expect this job to return `:unknown` sometimes. And the throughput
+difference between individual runs of this config is dominated by which faults
+the nemesis happens to draw, not by the flag: an intermediate run with the same
+`one,majority` targets managed only 22 acknowledged writes where the verified
+one managed 363.
 
 ## Closed: `/v1/kv/snapshot-floor` reported zero live holds while holds were live
 
@@ -963,6 +995,117 @@ carries a real `liveHolds: 0` — is still classified as "nothing was measured"
 rather than "no holds". Requiring both, rather than inferring from the count
 alone, is what makes that hold.
 
+## Closed: unclassifiable HTTP 500s when an inter-node gRPC stream dies
+
+*Found 2026-08-08 on `/v1/kv/snapshot-floor`; fixed in kahuna `c67ab1f`, and the
+fix showed the blast radius was four times larger than the report.*
+
+**This was under-reported when filed.** It went in as a floor-endpoint bug
+because the floor endpoint is the only place the harness could see it: that
+client branch records `(:status r)` when the response carries no recognizable
+type, so it alone produced a legible `[:floor 500 "n1"]`. Every other endpoint
+recorded the same condition as `[:write nil]`, `[:read nil]`,
+`[:read-latest nil]` — a nil error type meaning "the server sent something this
+client could not parse" — and those sat in the same error tally where the 500s
+were found, read past as ordinary fault noise. Same 300 s `partition` config,
+counted properly:
+
+| | before `c67ab1f` | after |
+|---|---|---|
+| `[:floor 500 …]` | 18 | 0 |
+| `[:write nil]` | 186 | 0 |
+| `[:read nil]` | 42 | 0 |
+| `[:read-latest nil]` | 35 | 0 |
+| `[:acquire nil]` / `[:pin-lost-race nil]` | 6 | 0 |
+| **total unclassifiable** | **287** | **0** |
+
+It was never confined to the floor read; it hit the main KV data path.
+
+`GetSnapshotFloor` answers from the meta-partition leader, routing to it when
+this node is not it (`KeyValuesManager.cs:940`). Every other exit from that
+method returns a typed `KeyValueResponseType`; the routed one is
+`return await interNodeCommunication.GetSnapshotFloor(leader, ct)` with no
+guard, so a gRPC transport failure escapes as an exception and the client gets
+an HTTP 500 with a non-JSON body.
+
+`RetryableExceptionMapping` exists precisely to stop that — its own doc comment
+names "an inter-node gRPC stream dying mid-forward" as the case it catches. It
+misses this one for two independent reasons:
+
+```csharp
+public static bool IsRetryable(Exception ex) => ex switch
+{
+    RaftException => true,
+    RpcException rpc => rpc.StatusCode is StatusCode.Unavailable or StatusCode.DeadlineExceeded or StatusCode.Cancelled,
+    _ => false,
+};
+```
+
+1. **The status is `Internal`, not `Unavailable`.** A dead HTTP/2 connection
+   surfaces as `RpcException: Status(StatusCode="Internal", Detail="Error
+   starting gRPC call. HttpRequestException: The HTTP/2 server didn't respond to
+   a ping request within the configured KeepAlivePingDelay")`. That is exactly
+   "no definitive answer was produced", which is the predicate the comment
+   states, but it is not in the allowed status list.
+2. **Only the outermost exception is inspected.** The same stack also throws
+   `AggregateException: One or more errors occurred. (Status(StatusCode=...))`.
+   No unwrapping of `InnerException`/`InnerExceptions`, so even a genuinely
+   `Unavailable` RpcException escapes once something wraps it. The node logged
+   22 `Unavailable` RpcExceptions in the same run.
+
+**Why the 500s outlive the fault.** Seven of the eighteen landed in a window
+with *no fault active* — the partition that broke the connection ended at
+15:14:36 and the network was healed from 15:15:06 to 15:15:25, yet n1 kept
+answering 500 until 15:15:33. An HTTP/2 keep-alive ping timeout poisons a
+pooled connection; the pool keeps handing out the dead one until it is
+discarded. So the blast radius of a partition on this endpoint extends well past
+the partition, and a run that only samples during faults will miss it.
+
+**Impact.** No checker was corrupted — these arrive as `:fail`/`:info` rather
+than as observations, and the runs still passed every safety property. What
+broke is the retry contract: a client loop cannot classify a 500 with a
+non-JSON body, which is the same failure this endpoint already had once (see
+the closed "answered 200 with a body it could not express" above). The refusal
+path is where this endpoint's bugs live.
+
+### Fixed — and the evidence is 267 refusals, not an absence
+
+`c67ab1f` fixes it at both layers, and is stricter than the report suggested:
+`InterNodeTransportFailure.IsRetryable` treats `Internal` as retryable **only**
+when `Status.DebugException` or `InnerException` is an `HttpRequestException`,
+`IOException` or `SocketException`, so a remote *application* error reporting
+Internal still propagates. `RetryableExceptionMapping.IsRetryable` now recurses
+through `AggregateException.InnerExceptions` and `InnerException`. The
+forwarding site in `GrpcInterNodeCommunication.GetSnapshotFloor` also returns a
+typed `MustRetry` directly rather than relying on the middleware — belt and
+braces, and correct because a floor read is side-effect free.
+
+Two 300 s runs (`partition`, and `partition,kill` at `--kill-targets
+one,majority`): zero 500s, zero nil-type errors, both `:valid? true`. The
+`partition` run was emphatically non-vacuous — 450 protected reads, 167 holds,
+356 below head, max depth 32.
+
+Absence would be weak evidence on its own, since the original 500s appeared in
+only one run of four. The real proof is the **presence** of the new refusals in
+the node logs:
+
+| `Mapping unhandled retryable RpcException on …` | before | after |
+|---|---|---|
+| `/v1/kv/try-set` | 0 | 157 |
+| `/v1/kv/try-get` | 0 | 83 |
+| `/v1/kv/snapshot-hold/release` | 0 | 16 |
+| `/v1/kv/snapshot-hold/renew` | 0 | 11 |
+
+Zero before, 267 after, on the same workload and fault set. Every one of those
+is an exception the old `IsRetryable` returned false for — that is, a 500 the
+old build would have emitted. The forwarding guard in `GetSnapshotFloor` did not
+fire in either run; the middleware backstop caught everything, which is the
+layering working as designed.
+
+Not a regression from `65fcc70` — the routed branch is what that commit added,
+so the floor endpoint was newly *reachable* rather than newly broken. The
+`try-set`/`try-get` exposure predates it.
+
 ## Harness bugs worth remembering
 
 All of these produced verdicts that looked like server findings.
@@ -1022,6 +1165,42 @@ silently-disabled health sampler. Comparisons in a checker should use `= 0`
 rather than `zero?` for exactly this reason: a checker that crashes on
 malformed input tells you less than one that ignores it, and both are better
 than one that reads it as a real observation.
+
+**An indeterminate release the checker could not name.** The snapshot floor
+checker returned ten violations against a server that had done nothing wrong.
+`hold-windows` deliberately ends a hold's protection window on an *indeterminate*
+release — a release that timed out may well have taken effect — but it can only
+do that for a release op carrying a `:hold-id`. `with-errors` assoc'd its
+`:type :info` onto the original *invocation*, whose value is `nil`, so every
+release that failed at the transport layer arrived anonymous. The window then ran
+to the lease bound (600 s), and each subsequent `live-holds 0` inside it was
+reported as a hold vanishing from the registry.
+
+The trace was unambiguous once found: hold `918a3fca…` pinned at 14:52:15.457,
+floor reporting `live-holds 1` through 14:52:17.8, a
+`:info :release nil :timeout` at 14:52:20.507, and the first `live-holds 0`
+223 ms later at 14:52:20.730. The server had released the hold exactly as asked.
+
+Two things made this survive review. First, it only bites under `kill` —
+transport-level failures are rare under `partition` alone, which is why the
+partition-only and no-fault verification runs were clean. Second, and worse, the
+checker-side behaviour *was* tested:
+`an-indeterminate-release-still-ends-protection` hand-writes a release op with a
+`:hold-id` in its value and passes whether or not the client can produce one. The
+bug lived in the seam between two individually-tested halves.
+`a-release-that-throws-still-names-the-hold` now asserts that seam by driving the
+real client with a throwing HTTP call, and fails against the old code.
+
+**A nil error type that meant "unparseable server response".** When a response
+carries no recognizable type, most client branches record `[:write nil]`,
+`[:read nil]`, `[:read-latest nil]` — visually indistinguishable from ordinary
+fault noise in an error tally, and easy to read straight past. They are not
+noise: they mean the server sent a body the client could not classify. The floor
+branch alone falls back to `(:status r)`, which is why a server-wide 500 bug was
+first filed as a floor-endpoint bug and its true scope (287 responses per run,
+mostly on `try-set`/`try-get`) only emerged once it was fixed. **Worth doing:**
+record the HTTP status on every branch the way the floor branch does, so an
+unclassifiable response names itself instead of arriving as `nil`.
 
 **A slingshot selector applied to non-maps.** `(contains? % :kahuna/abort)` was
 evaluated against every thrown object, including the `SocketTimeoutException`s
