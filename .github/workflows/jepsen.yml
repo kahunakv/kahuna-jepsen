@@ -49,11 +49,19 @@ jobs:
             faults: kill
             concurrency: 9
             ops_per_key: 60
+          # `all` is dropped here, and only here. The `kill`-only job above
+          # keeps it: a full-cluster kill with no partition is the durability
+          # test, and the cluster gets the whole interval to come back. Combined
+          # with `partition` it is self-defeating -- restarts cost up to 8.5 s of
+          # the 15 s interval, so the run spends itself on `:connection-refused`
+          # and acknowledges too few writes for a `cas` to ever match. See
+          # FINDINGS.md, "the `cas` starvation gate".
           - workload: register
             faults: partition,kill
             concurrency: 8
             concurrency_per_key: 2
             ops_per_key: 40
+            kill_targets: one,majority
           # The lock workload's checkers are linear-time, so it needs none of
           # the register workload's search-cost tuning.
           - workload: lock

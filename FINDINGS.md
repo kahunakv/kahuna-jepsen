@@ -6,7 +6,7 @@ For *why* the tests are shaped the way they are, see [DESIGN.md](DESIGN.md).
 
 | Workload | Checks | Status |
 |---|---|---|
-| `register` | linearizable CAS register (Knossos) | green; found a stale-read violation, since fixed and verified |
+| `register` | linearizable CAS register (Knossos) | found a stale-read violation under minority isolation, since fixed and verified. **A second, unrelated violation is open and root-caused** — a follower that grants a higher-term vote does not adopt the term, so a deposed leader keeps committing acknowledged writes (`RaftPartitionStateMachine.cs:2390`) |
 | `lock` | mutual exclusion + fencing-token monotonicity, lease-aware | green as of Kommander 1.0.10; found a fencing rollback (fixed, 16/16 verified) and a checker bug that faked exclusion violations |
 | `append` | Elle list-append over interactive transactions | found four real bugs; three fixed (write skew closed on absence, 29 runs), HTTP 500 all but fixed |
 | `sequencer` | no id handed out twice; allocation-range integrity; idempotent replay | new; found an HTTP 500 on the redirect path before a nemesis was even enabled. Now in the nightly matrix under `partition` and `partition,kill` |
@@ -270,6 +270,151 @@ not a fault-injection run.
 To diagnose a failing run, map the stale reader to its node —
 `thread = process mod concurrency`, `node = thread mod 5 + 1` — and check it
 against the `:start-partition` topology in `jepsen.log`.
+
+## Open: a deposed leader keeps committing — a follower acks the old term after voting in the new one
+
+Nightly `register / partition`, 2026-08-11 05:02 UTC, kahuna `738de70`
+(Kommander 1.0.16). Knossos: `can't read 4 from register 0`. Key 4 only; the
+other four keys were clean.
+
+```
+05:02:30,810  proc 10 (n2)  :invoke :cas  [4 [4 0]]
+05:02:30,817  proc 10 (n2)  :ok     :cas  [4 [4 0]]   ← register 4 → 0, committed
+05:02:31,408  proc 27 (n1)  :invoke :read [4 nil]
+05:02:31,441  proc 27 (n1)  :ok     :read [4 4]       ← stale, 624 ms later
+```
+
+No linearization rescues it. Every `:info` op in flight on key 4 at that moment
+— `write [4 2]` (proc 18), `write [4 3]` (proc 1), `cas [4 [3 3]]` (proc 29),
+a read (proc 38) — writes 2 or 3. Nothing writes 4.
+
+**This is not the fault shape the 2026-08-06 fix addressed.** That one was a
+minority-isolated leader; `ConfirmLeadershipForRead` closes it by requiring a
+quorum-confirmed read index. Here the fault was `majorities-ring`
+(05:02:26 → 05:02:42):
+
+```
+n1 cut off from {n2, n4}  → n1 reaches {n1, n3, n5}
+n2 cut off from {n1, n3}  → n2 reaches {n2, n4, n5}
+```
+
+Both sides hold a majority, overlapping at n5 — and n5 straddling the two sides
+is what makes the bug below reachable.
+
+Both nodes served successful writes to key 4 inside the one partition window —
+n2 at 30.817, n1 at 31.896 and 32.956, each in 5–8 ms. (n3's `:ok` at 34.686 is
+not evidence of a third: n3 reaches n1 and can route to it.)
+
+Node mapping, since it is needed to read any of this: `thread = process mod
+concurrency`, `node = thread mod 5 + 1`. Here concurrency 9, so proc 10 → n2 and
+proc 27 → n1.
+
+### Not reproduced locally — and the first 16 runs proved almost nothing
+
+At `7a65ee4` (only a backup storage layer separates it from `738de70`; nothing
+on this path):
+
+| Batch | Runs | Max term reached | Result |
+|---|---|---|---|
+| default fault mix | 6 | 2 | clean |
+| `majorities-ring` only | 10 | 2 | clean |
+| `partition,pause` | 4 | 5–6 | clean |
+| `majorities-ring` + `pause` | 3 | 3–4 | clean |
+
+The max-term column is the whole story. **In a ring partition the leader keeps
+two peers, so it never loses quorum, no rival wins a pre-vote, and leadership
+never moves** — `n1/kahuna.log` never gets past term 2 across a full 180 s run
+with 9 ring windows. With no leadership change there is no window in which a
+stale read is even possible, so those 16 runs are not evidence of a fix; they
+are evidence that the local cluster is too fast and too quiet to build the
+precondition. Only `pause` forces leadership to move here. CI gets that churn
+for free from a slower, noisier runner.
+
+Count the 7 churn-bearing runs, not the 23.
+
+### Root cause, confirmed from the per-node logs
+
+The CI artifact (`jepsen-register-0-1`) settled it. None of the three candidates
+was right — and the read side turned out to be innocent. **The bug is on the
+write side: a deposed leader kept committing and acknowledging client writes,
+because a follower that had already voted in the new term went on acking the
+old term's appends.**
+
+The node logs carry no wall-clock timestamps, but every replication line embeds
+an HLC whose second field is epoch-millis (`HLC(2:1786424550813:0)` =
+05:02:30.813), which aligns them to `jepsen.log` exactly.
+
+Key 4 lives on Raft partition 3. Sequence:
+
+```
+~05:02:24    n5/p3  Sending vote to n1:8082 on Term=2        ← n5 votes for n1
+ 05:02:30.410 n1/p3  proclamed leader Term=2 Votes=3 (n3,n5) Local=94
+ 05:02:30.813 n2/p3  Proposed logs Logs=98   ← TrySet jepsen/register/4, SetIfEqualToValue
+ 05:02:30.813 n5/p3  Received logs from leader n2:8082 with Term=1 Logs=98   ← ACCEPTED
+ 05:02:30.816 n2/p3  Committed proposal Logs=98 Time=3ms     ← client gets :ok
+ 05:02:31.44  n1/p3  TryGet jepsen/register/4 Response=Get   ← returns 4, its log stops at 94
+ 05:02:31.232 n2/p3  Got LeaderInOldTerm from n5:8082        ← n5 finally fences n2
+ 05:02:32.226 n1/p3  Proposed logs Logs=98                   ← index 98 reused, different entry
+```
+
+n1's election was legitimate: it had the most complete log of its side
+(`Local=94` against n3's 62 and n5's 61), won a real quorum, and its read went
+through a confirmed read index. It simply never had entries 95–98, because
+those were replicated on the other side of the ring.
+
+n2's commit of entry 98 was not legitimate. Its quorum was `{n2, n4, n5}`, and
+n5's ack should have been impossible — n5 had already voted for n1 in Term 2.
+n5's own log shows it accepting the Term-1 append (plain `Received logs from
+leader`, not the `old ReceivedTerm=... Ignoring...` form) and only *afterwards*
+recording `Leader is now n1:8082 LeaderTerm=2`.
+
+The defect is one condition, `RaftPartitionStateMachine.cs:2390`:
+
+```csharp
+if (voteTerm > currentTerm && nodeState != RaftNodeState.Follower)
+{
+    ...
+    currentTerm = voteTerm;
+```
+
+Term adoption on a higher-term vote is gated on **not** being a Follower. The
+comment above it says so outright: *"Follower-side term adoption on a
+higher-term vote is likewise deferred to B2b — here we only fix the
+Leader/Candidate fencing bug."* n5 was a Follower, so it granted the vote and
+left in-memory `currentTerm` at 1. The append fence is
+
+```csharp
+if (currentTerm > leaderTerm)   // 1 > 1 → false
+```
+
+so every Term-1 append from n2 sailed through. Raft §5.1 requires a node to
+adopt term T when it grants a vote in term T, whatever its state.
+
+Note the persisted/in-memory divergence: line 2452 does
+`PersistHardStateAsync(voteTerm, node.Endpoint)`, so the WAL says term 2 while
+the running node still says term 1. A restart would fence correctly; the live
+node does not. That also means the window is invisible to any check that reads
+hard state.
+
+Blast radius is wider than one stale read. For ~820 ms (05:02:30.41 → 05:02:31.23)
+n2 committed entries 97, 98 and 99 as a superseded leader and returned `:ok` for
+them, and n1 then reused indices 96–99 for different Term-2 entries that n4 and
+n5 accepted. Acknowledged writes were lost, not merely read late. The stale read
+is how Knossos noticed.
+
+**Fix:** adopt `voteTerm` unconditionally when granting (or even when
+considering) a higher-term vote, dropping the `nodeState != Follower` clause —
+the step-down bookkeeping around it stays gated on state, but the term
+assignment must not be. This is the `B2b` item the comment defers.
+
+### Why local repro was never going to work
+
+Every one of the 23 local runs kept a single leader on the key's partition. The
+precondition here is a *leadership change on a specific user partition during a
+ring window*, with a follower straddling both sides. The local cluster is fast
+enough that ring partitions never expire a leader lease; CI's slower runner does
+it routinely. Rather than chase it with more `pause` runs, verify the fix
+directly against the condition above.
 
 ## Closed: fencing tokens regressed under partition + kill
 
@@ -918,7 +1063,10 @@ re-fires before the cluster is usable, because a full restart costs ~2.4 s to
 open the port and another ~2.2 s to reach consensus out of a 15 s interval.
 
 A full-cluster kill is a legitimate fault for `register` or `lock`, whose state
-is the client's. It is self-defeating here: it destroys every live hold, and
+is the client's — though it later had to come out of `register / partition,kill`
+too, for the throughput reason rather than the hold-destroying one; see "the
+`cas` starvation gate" below. It is self-defeating here: it destroys every live
+hold, and
 re-pinning costs a leader election plus a fresh write, so the run spends its
 budget re-acquiring instead of reading retained history. `--kill-targets` now
 exists for this; the CI job passes `one,majority`. On the same 300 s config that
@@ -1105,6 +1253,61 @@ layering working as designed.
 Not a regression from `65fcc70` — the routed branch is what that commit added,
 so the floor endpoint was newly *reachable* rather than newly broken. The
 `try-set`/`try-get` exposure predates it.
+
+## The `cas` starvation gate: `register / partition,kill` failed on availability
+
+*Not a server finding. A CI gate that decided runs on a coin flip, and the
+config change that stopped it.*
+
+Three consecutive nightlies on the same commit (`912a501`), same job, same
+verdict from the checker that matters and three different verdicts from CI:
+
+| run | date | `cas` `:ok-count` | overall `:ok` / `:count` | CI |
+|---|---|---|---|---|
+| 31295629128 | 08-09 | **1** | 97 / 1582 | green |
+| 31460212658 | 08-11 | **0** | 71 / 1555 | red |
+| 31566485869 | 08-12 | **0** | 130 / 1547 | red |
+
+`:workload {:valid? true}` in all three — every key linearizable, no violation,
+`:exceptions {:valid? true}`. The only thing that failed was `:stats`
+(`checker/stats`, wired at `src/kahuna/core.clj:98`), which marks a run invalid
+when any `:f` never once succeeds. One CAS landing out of ~500 was the entire
+difference between green and red.
+
+That zero is downstream of unavailability, not of anything wrong with CAS. The
+08-12 error tally:
+
+| error | count |
+|---|---|
+| `:connection-refused` | 713 |
+| `:must-retry` | 516 |
+| `:cas-mismatch` | 117 |
+| `:timeout` | 55 |
+| `:no-http-response` | 15 |
+
+Only 117 of 516 CAS operations ever got a definitive answer, and **18 of the 28
+keys that saw a mismatch had zero acknowledged writes** — the register was still
+unset, so mismatching was the correct answer. The run acknowledged 19 writes
+total. There was nothing on most keys for a CAS to match against.
+
+The cause is the same one already written up for `snapshot` above: `:kill :all`
+inside a 15 s nemesis interval. In 180 s the nemesis fired 6 kills (1× `all`,
+3× `majority`, 2× `one`) on top of 14 partitions, and a restarted node took up
+to 8490 ms to reopen its port (median 2085 ms). `:recovery` agreed — 5 fault-free
+windows, 2 recovered, `:starved-window-ms (0 36)`: the next fault arrives before
+the cluster is usable.
+
+`--kill-targets one,majority` on that job now, matching `snapshot`. The
+`register / kill` job keeps `all`, and should: a full-cluster kill with no
+partition is a durability test — the cluster gets the whole interval to come
+back, and that job has stayed green throughout.
+
+Two things to keep in mind before reading a future red here as a regression.
+This does not raise `cas :ok-count` directly, it raises acknowledged writes, and
+CAS success follows from those — so the gate is still ultimately a threshold of
+one on a scarce event, just a much less scarce one. And `:stats` failing while
+`:workload` passes is *always* an availability verdict, never a safety one;
+check which of the two is `false` before filing anything.
 
 ## Harness bugs worth remembering
 
