@@ -227,9 +227,14 @@
                   :key           key
                   :revision      -1
                   :readTimestamp (or read-timestamp hlc-zero)
-                  ;; NOTE: KahunaGetKeyValueRequest tags Durability with
-                  ;; [JsonPropertyName("value")] — that is not a typo here.
-                  :value         durability}
+                  ;; Was `:value` until Kahuna 023bfb1 ("Fix REST JSON field
+                  ;; names"), which corrected KahunaGetKeyValueRequest's
+                  ;; [JsonPropertyName] from "value" to "durability". The old
+                  ;; spelling does not fail loudly against a current server: an
+                  ;; unmapped member is ignored, Durability defaults to
+                  ;; Ephemeral, and every read of a persistent key comes back
+                  ;; DoesNotExist. See FINDINGS.md.
+                  :durability    durability}
                  {:timeout timeout})
         t (kv-response-type (:type r))]
     {:type          t
@@ -292,7 +297,10 @@
                                    :or   {durability persistent}}]
   (let [r (post! node "/v1/locks/try-lock"
                  {:resource   resource
-                  :lockId     (->b64 owner)
+                  ;; `owner`, not `lockId`: renamed by Kahuna 023bfb1. A server
+                  ;; on the new name binds no Owner from `lockId` and refuses
+                  ;; with InvalidInput before doing any work.
+                  :owner      (->b64 owner)
                   :expiresMs  expires-ms
                   :durability durability}
                  {:timeout timeout})]
@@ -302,7 +310,7 @@
   [node resource owner {:keys [durability timeout] :or {durability persistent}}]
   (let [r (post! node "/v1/locks/try-unlock"
                  {:resource   resource
-                  :lockId     (->b64 owner)
+                  :owner      (->b64 owner)
                   :expiresMs  0
                   :durability durability}
                  {:timeout timeout})]

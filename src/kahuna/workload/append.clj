@@ -159,7 +159,9 @@
                                                   :key            key
                                                   :revision       -1
                                                   :readTimestamp  kc/hlc-zero
-                                                  :value          kc/persistent
+                                                  ;; `durability`, not `value` —
+                                                  ;; see the note in kc/kv-get.
+                                                  :durability     kc/persistent
                                                   :coordinatorKey coordinator}
                                                  (op-id))
                                           http)
@@ -187,7 +189,7 @@
                                                           :key            key
                                                           :revision       -1
                                                           :readTimestamp  kc/hlc-zero
-                                                          :value          kc/persistent
+                                                          :durability     kc/persistent
                                                           :coordinatorKey coordinator}
                                                          (op-id))
                                                   http)
