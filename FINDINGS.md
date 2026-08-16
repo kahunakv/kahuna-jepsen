@@ -6,7 +6,7 @@ For *why* the tests are shaped the way they are, see [DESIGN.md](DESIGN.md).
 
 | Workload | Checks | Status |
 |---|---|---|
-| `register` | linearizable CAS register (Knossos) | found a stale-read violation under minority isolation, since fixed and verified. **A second, unrelated violation is open and root-caused** — a follower that grants a higher-term vote does not adopt the term, so a deposed leader keeps committing acknowledged writes (`RaftPartitionStateMachine.cs:2390`) |
+| `register` | linearizable CAS register (Knossos) | found a stale-read violation under minority isolation, since fixed and verified. **A second, unrelated violation is open** — a follower that grants a higher-term vote does not adopt the term, so a deposed leader keeps committing acknowledged writes. Root-caused; the Kommander fix landed 2026-08-13 (`RaftPartitionStateMachine.cs:2714`) but no run has confirmed it yet. Separately, this workload will report `:valid? true` on a read path that returns nothing at all — see "a `nil` read means two different things" |
 | `lock` | mutual exclusion + fencing-token monotonicity, lease-aware | green as of Kommander 1.0.10; found a fencing rollback (fixed, 16/16 verified) and a checker bug that faked exclusion violations |
 | `append` | Elle list-append over interactive transactions | found four real bugs; three fixed (write skew closed on absence, 29 runs), HTTP 500 all but fixed |
 | `sequencer` | no id handed out twice; allocation-range integrity; idempotent replay | new; found an HTTP 500 on the redirect path before a nemesis was even enabled. Now in the nightly matrix under `partition` and `partition,kill` |
@@ -406,6 +406,23 @@ is how Knossos noticed.
 considering) a higher-term vote, dropping the `nodeState != Follower` clause —
 the step-down bookkeeping around it stays gated on state, but the term
 assignment must not be. This is the `B2b` item the comment defers.
+
+### The fix has landed upstream; this stays open until a run proves it
+
+Kommander now assigns `currentTerm = voteTerm` outside the step-down guard
+(`RaftPartitionStateMachine.cs:2714`, with `stepDown` reduced to a local
+controlling only the bookkeeping), and `af16b6f` ("Handle higher-term append
+acks correctly") makes a leader step down and persist the newer term when an
+append ack returns one. Both shipped 2026-08-13.
+
+Not verified here, and the reason is worth recording. Every nightly from
+2026-08-14 until `27b6363` was blind: the harness was sending a stale field name
+and *every* register read came back empty, which Knossos accepts as a wildcard.
+The runs that should have exercised this fix proved nothing at all — see the
+wrong-dialect section below. The first genuinely-observing run since is green,
+but this violation took 23 local runs and several nightlies to surface once, so
+one green run is not evidence. Leave it open until `register / partition`
+accumulates clean runs on a build carrying both commits.
 
 ### Why local repro was never going to work
 
@@ -1309,6 +1326,120 @@ one on a scarce event, just a much less scarce one. And `:stats` failing while
 `:workload` passes is *always* an availability verdict, never a safety one;
 check which of the two is `false` before filing anything.
 
+## Closed: the harness spent a day talking to the server in the wrong dialect
+
+*Two renamed JSON field names took out 8 of 15 nightly jobs and silently
+blinded 5 more. Fixed in `27b6363`; 15 of 15 green and verified on run
+[31827395857](https://github.com/kahunakv/kahuna-jepsen/actions/runs/31827395857).*
+
+Kahuna `023bfb1` ("Fix REST JSON field names") corrected two `[JsonPropertyName]`
+attributes that had drifted from their C# properties. This harness was written
+against the drifted names on purpose — `client.clj` even carried a comment
+insisting `:value` "is not a typo here" — so the fix broke us.
+
+| DTO | was | now | harness sites |
+|---|---|---|---|
+| `KahunaLockRequest` | `lockId` | `owner` | `client.clj` ×2 |
+| `KahunaGetKeyValueRequest` | `value` | `durability` | `client.clj` ×1, `append.clj` ×2 |
+
+**Neither break is loud, and that is the whole lesson.** `KahunaJsonContext` sets
+no `UnmappedMemberHandling.Disallow`, so an unrecognized member is discarded
+rather than rejected. The server binds the property's default and answers
+normally. There is no 400, no error string, nothing in the response that names a
+field.
+
+What each default did:
+
+* **`Owner` → null.** `LocksHandlers` checks `request.Owner is null` and returns
+  `InvalidInput` before doing any work. All four lock jobs: **0 `:ok` out of
+  ~1800 operations, zero indeterminate, one error type.**
+* **`Durability` → `0` = `Ephemeral`.** Writes still sent `durability` correctly
+  and landed in the persistent keyspace. Every *read* went to the ephemeral one
+  and found nothing.
+
+The three read-side symptoms looked like three unrelated server bugs:
+
+| workload | what it looked like | what it was |
+|---|---|---|
+| `snapshot` | 266 of 280 pins failing `DoesNotExist` against keys with 982 acknowledged writes — i.e. data loss | reads in the wrong keyspace |
+| `append` | `:G2-item`, `:internal`, `:lost-update` — an isolation collapse | 4098 nil reads, so every RMW restarted from an empty list |
+| `register` | **nothing at all — `:valid? true`** | see below |
+
+### The half that passed
+
+The five register jobs went green while their read path returned nothing:
+
+| job | reads returning a value | returning `nil` |
+|---|---|---|
+| `register / partition` | **0** | 507 |
+| `register / kill` | **0** | 371 |
+| `register / partition,kill` | **0** | 212 |
+| `register / pause` | **0** | 453 |
+
+The previous night's `register / partition`, on the last pre-rename build: 573
+values, 18 nils.
+
+`RegisterClient` maps `:does-not-exist` to `:ok` with value `nil`, which is
+right — an unwritten register *is* nil. But `knossos/model.clj:79` treats a
+`nil` read value as *unknown*, not as *the value nil*:
+
+```clojure
+:read (if (or (nil? (:value op)) (= value (:value op))) r (inconsistent ...))
+```
+
+That branch exists because a Jepsen client fills in the read value on
+completion, so `nil` means "not yet filled in" and must match any state. Two
+meanings of `nil` collide at the model boundary, and every one of those 1543
+reads became a free pass. The history contains `:ok :write [0 3]` followed
+immediately by `:ok :read [0 nil]`, and the checker certifies it. `:stats`
+agreed the read path was healthy — `read` had `:ok-count 507`.
+
+This second defect is not fixed by the rename and is filed separately; see the
+bullet below.
+
+### What it cost
+
+A full day of nightlies that proved nothing, over exactly the window in which
+Kommander shipped `af16b6f` ("Handle higher-term append acks correctly") and the
+B2b follower term-adoption fix at `RaftPartitionStateMachine.cs:2714` — the fix
+for the violation still written up as open above. The suite existed to check
+that change and reported health instead.
+
+### The fix, and what verified it
+
+Five keyword renames in `27b6363`, no server change. Green is not the evidence —
+the register jobs were green before. The evidence is that the runs now observe
+things:
+
+| | before | after |
+|---|---|---|
+| `register` value-reads (4 jobs) | 0 / 0 / 0 / 0 | 519 / 303 / 203 / 197 |
+| `lock` acquires | 0 of ~1800 | 132, 74, 72, 124 |
+| `lock` error mix | 100% `:invalid-input` | `:busy` 662, `:invalid-owner` 597, `:must-retry`, `:timeout` |
+| `snapshot` protected reads | 20, floor is 25 | **418 and 257**, max depth 19 and 30 |
+| `snapshot` pins | 0 ok, 266 `DoesNotExist` | 160 ok, 1 `DoesNotExist` |
+| `append` read micro-ops | 4098 nil, 0 values | 973 values |
+| `append` verdict | `:G2-item :internal :lost-update` | `:valid? true` |
+
+The snapshot numbers are worth a second look: 418 protected reads against a
+floor of 25, where the historical best on that job was 30. Some of the
+`:unknown` washouts written up above were this bug, not only the `:kill :all`
+budget.
+
+### Why nothing caught it
+
+`023bfb1` added `TestRestWireFieldNames.cs`, which pins the new names in the
+server's own suite. It cannot catch this: the only consumer exercising the old
+names lives in another repository and runs on a nightly schedule. The server's
+contract tests and this harness's expectations share no artifact. **A wire
+contract that is asserted independently on both sides is not a contract.**
+
+Two guards worth having, neither built yet:
+
+* An OpenAPI document checked into `kahuna` and validated against in this repo's
+  CI, so a rename fails in the server's own PR rather than here a day later.
+* An observation floor per workload — see the next section.
+
 ## Harness bugs worth remembering
 
 All of these produced verdicts that looked like server findings.
@@ -1316,6 +1447,20 @@ All of these produced verdicts that looked like server findings.
 **`release-start` overwritten by release retries** invented mutual-exclusion
 violations for months of runs — the largest false finding in the project. Written
 up in full in the closed exclusion section above.
+
+**A `nil` read means two different things, and the model only knows one of them.**
+`RegisterClient` reports `:does-not-exist` as `:ok` with value `nil`, because an
+unwritten register is nil. Knossos reads a `nil` read value as *unfilled*, and
+matches it against any state (`knossos/model.clj:79`). So a read the workload
+means as an observation arrives at the checker as an absence of one. 1543
+consecutive blind reads across four jobs certified `:valid? true`; see the
+section above. **Still open** — the rename fix restored the reads but not the
+checker's ability to notice if they stop again. The guard wanted is an
+observation floor on the run, in the shape of `min-protected-reads` in
+`workload/snapshot.clj`: acknowledged writes plus zero non-nil reads is
+`:unknown`, never `true`. Worth reporting `:value-reads` / `:nil-reads` in
+`results.edn` too — that ratio is what made this diagnosable, and it currently
+takes hand-processing the history to get.
 
 **Missing operation ids** made every transaction fail with `InvalidInput`, so
 nothing committed and Elle reported `:empty-transaction-graph`. Every
