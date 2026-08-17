@@ -161,16 +161,43 @@
 (defn base-url [node]
   (str "http://" node ":" http-port))
 
+(defn- json-body
+  "The response body as a map, whether or not clj-http decoded it — nil when it
+  is not JSON at all.
+
+  clj-http decodes `:as :json` only for *unexceptional* statuses: `:coerce`
+  defaults to `:unexceptional`, and `can-parse-body?` forces everything else to
+  a raw String. That is not a cosmetic detail here. Kahuna reports refusals as
+  **409 with a body**, so its entire outcome vocabulary — `NotLeader`,
+  `Indeterminate`, `BelowMinRangeSize`, and the `determinate` flag a
+  fault-injection harness must read before deciding whether a retry is safe —
+  lives exactly where clj-http stops parsing. Without this, every refusal in
+  this suite arrives as all-nils and a caller cannot tell 'try the next node'
+  from 'the map may still be changing'.
+
+  Parsed here rather than by asking clj-http for `:coerce :always`, because that
+  decodes unconditionally and *throws* on a body that is not JSON — and an
+  unhandled ASP.NET 500 answers text/plain, which this suite has already been
+  bitten by. A body that will not parse, or parses to something that is not a
+  map, yields nil, which every caller already treats as 'nothing was learned'."
+  [body]
+  (cond
+    (map? body)    body
+    (string? body) (let [parsed (try (json/parse-string body true)
+                                     (catch Exception _ nil))]
+                     (when (map? parsed) parsed))
+    :else          nil))
+
 (defn- normalize
-  "clj-http's :as :json only parses when the response *is* JSON. A 500 with an
-  ASP.NET text/plain body, or an empty body, yields a String — assoc'ing onto
-  that throws ClassCastException mid-history. Non-map bodies become a map with
-  no :type, which `response-class` treats as indeterminate."
+  "Flattens a response body to the top level and adds :status.
+
+  A body that is not JSON at all — an empty body, or an ASP.NET text/plain 500 —
+  becomes a map with no :type, which `response-class` treats as indeterminate.
+  Assoc'ing onto the String directly would throw ClassCastException mid-history."
   [resp]
-  (let [body (:body resp)]
-    (if (map? body)
-      (assoc body :status (:status resp))
-      {:type nil :status (:status resp) :body body})))
+  (if-let [body (json-body (:body resp))]
+    (assoc body :status (:status resp))
+    {:type nil :status (:status resp) :body (:body resp)}))
 
 (defn post*
   "POSTs `body` as JSON to `path` on `node`, returning {:status int :body parsed}
@@ -180,7 +207,11 @@
   `status`. `KahunaSetReplicationFactorResponse` does: it reports the commit
   outcome (`Success`, `Refused`, …) there, and flattening would replace it with
   the HTTP status code, so a refusal would read as the number 409 rather than as
-  the reason it was refused."
+  the reason it was refused.
+
+  `:body` is nil when the response was not JSON. It is *not* nil merely because
+  the call was refused: refusals are exactly where the interesting body is, and
+  `json-body` exists because clj-http would otherwise hand back the raw string."
   ([node path body] (post* node path body {}))
   ([node path body opts]
    (let [timeout (:timeout opts 5000)
@@ -192,7 +223,7 @@
                              :connection-timeout timeout
                              :throw-exceptions   false
                              :as                 :json})]
-     {:status (:status resp) :body (:body resp)})))
+     {:status (:status resp) :body (json-body (:body resp))})))
 
 (defn post!
   "POSTs `body` as JSON to `path` on `node`. Returns the parsed body map with

@@ -588,29 +588,95 @@
      true
      (catch Object _ false))))
 
+(defn await-cluster-ready!
+  "Blocks until every node reports `/v1/cluster/health` ready, or the timeout
+  passes. Returns true, or false on timeout — never throws.
+
+  Stronger than the `await-cluster!` that `setup!` already does, and the
+  difference is what a key-range registration needs. `await-cluster!` waits for
+  `/v1/cluster/membership` to answer, which means the node is *listening*; a
+  node answers that about a second after launch and then refuses real work until
+  initialization completes. The seed descriptor is a replicated write forwarded
+  to the meta partition's leader, so registering before that partition has one
+  fails immediately — which is exactly what a first CI run did, 13 seconds after
+  the cluster started, with all six nodes refusing inside 230 ms."
+  ([test] (await-cluster-ready! test 120000))
+  ([test timeout]
+   (try+
+     (util/await-fn
+       (fn []
+         (or (every? ready? (:nodes test))
+             (throw (RuntimeException. "cluster not ready yet"))))
+       {:log-message "Waiting for every node to report ready"
+        :timeout     timeout
+        :interval    1000})
+     true
+     (catch Object _ false))))
+
+(def key-range-setup-timeout-ms
+  "How long to keep trying to establish key-range routing before failing setup."
+  120000)
+
+(def key-range-attempt-timeout-ms
+  "How long one registration attempt is given to converge before it is
+  re-issued. Short, because the thing being waited on is a single replicated
+  write: if it committed it lands well inside this, and if it did not, waiting
+  longer is waiting for something that is never coming."
+  15000)
+
 (defn establish-key-range!
   "Puts `space` under key-range routing cluster-wide, or fails the DB setup.
+
+  Registration is **re-issued**, not merely waited on, and that distinction is
+  the whole function. `RegisterKeyRangeAsync` does two things: it flips this
+  node's routing mode, which is local and always succeeds, and it seeds the
+  whole-space descriptor, which is a replicated write forwarded to the meta
+  partition's leader. When the second half fails the node answers
+  `Indeterminate` — mode flipped, no descriptor — and the server's advice is to
+  re-read the map, because a seed that committed on the leader may simply not
+  have replicated here yet. But a seed that was never accepted at all produces
+  the identical state, and no amount of polling a GET will conjure a descriptor
+  for it. Only another write will. A first CI run failed exactly this way: all
+  six nodes `Indeterminate`, then sixty seconds of polling for a descriptor that
+  no one had ever committed.
 
   Aborting is deliberate, and it is the opposite of how this suite treats a
   mid-run failure — there, a node that does not come back is a result the
   nemesis records. Setup is different: a run that could not establish key-range
   routing cannot split a range, so its history would be labelled `-kr` while
   testing hash routing. `:jepsen.db/setup-failed` is jepsen's own signal for
-  this and buys three whole teardown/setup cycles before the test gives up,
-  which is a plausible fix for a cluster that merely formed slowly."
+  this and buys three whole teardown/setup cycles before the test gives up."
   [test space]
-  (let [results (register-key-range! test space)]
-    (info "key-range registration for" space ":"
-          (into (sorted-map) (map (fn [[n r]] [n (or (:outcome r) :no-answer)])) results))
-    (when-not (await-key-range! test space)
-      (throw+ {:type         :jepsen.db/setup-failed
-               :message      (str "key space " space
-                                  " is not key-range routed on every node")
-               :key-space    space
-               :registration results
-               :ranges       (cluster-ranges test)}))
-    (info "key space" space "is key-range routed cluster-wide")
-    true))
+  (when-not (await-cluster-ready! test)
+    (warn "not every node reported ready; attempting key-range registration anyway"))
+  (let [deadline (+ (System/currentTimeMillis) key-range-setup-timeout-ms)]
+    (loop [attempt 1]
+      (let [results (register-key-range! test space)]
+        ;; The HTTP status is logged alongside the outcome on purpose. The
+        ;; outcome is the useful half, but it is also the half that goes blank
+        ;; if response parsing ever regresses — and when it did, a run reported
+        ;; six `:no-answer`s and gave no hint that six 409s were sitting behind
+        ;; them.
+        (info "key-range registration for" space "attempt" attempt ":"
+              (into (sorted-map)
+                    (map (fn [[n r]]
+                           [n [(or (:outcome r) :no-answer) (:http-status r)]]))
+                    results))
+        (cond
+          (await-key-range! test space key-range-attempt-timeout-ms)
+          (do (info "key space" space "is key-range routed cluster-wide") true)
+
+          (< (System/currentTimeMillis) deadline)
+          (recur (inc attempt))
+
+          :else
+          (throw+ {:type         :jepsen.db/setup-failed
+                   :message      (str "key space " space
+                                      " is not key-range routed on every node")
+                   :key-space    space
+                   :attempts     attempt
+                   :registration results
+                   :ranges       (cluster-ranges test)}))))))
 
 (defn decommission!
   "Removes `node` from the roster the way an operator would: commit the removal
