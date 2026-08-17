@@ -41,8 +41,9 @@ Not started:
 - [x] replication-factor profile — six nodes, per-partition replica placement,
       a nemesis that moves replicas (`src/kahuna/nemesis/placement.clj`) and a
       checker that refuses to call a run that moved nothing a pass
-      (`src/kahuna/checker/placement.clj`). **Run 2026-08-17: every workload
-      passed and the planner moved nothing** — see below.
+      (`src/kahuna/checker/placement.clj`). **Found that the planner moved
+      nothing (fixed in kahuna `09c99a1`), then that the compaction profile
+      never fired** — both below.
 - [x] key-range profile — the workload's key space routed by key order, a
       nemesis that forces splits and merge passes under load
       (`src/kahuna/nemesis/range.clj`) and a checker that fails on a gap or an
@@ -114,51 +115,82 @@ and 2 `Indeterminate` out of 8 attempts. Plausible under `partition`, and the
 harness classified them apart from refusals rather than manufacturing findings —
 which is what that distinction exists for. Worth watching if the ratio grows.
 
-## Open: the placement rebalancer never moves a replica
+## Closed: the placement rebalancer planned no moves at all
 
-**Confirmed across two independent runs (31991338560, 31992957463), five jobs
-each, on six nodes at RF 3 and RF 1.** Every placed run reports:
+**Found by the first two executions of the placement profile** (runs `31991338560`, `31992957463`),
+**fixed in kahuna `09c99a1`, confirmed by run `32049527245`.**
 
-```clojure
-:placement {:movement {:replicas-gained 0, :replicas-lost 0, :partitions-moved 0}
-            :transitional {:learners 0, :removings 0}
-            :transitions []
-            :log-markers {:unhosted 0, :imported 0, :exported 0}
-            :valid? :unknown, :cause :vacuous, :missing [:move :seeding :purge]}
-:workload {:linear {:valid? true}}
-```
+Across ten placed job-instances — six nodes, RF 3 and RF 1, three fault combinations — the planner
+moved zero replicas. `:replicas-gained 0`, `:learners 0`, `:removings 0`, and `Stopped hosting` /
+`Imported whole-partition state` at 0 in the node logs. Meanwhile a per-range override *committed*
+(`:set-rf {:partition 5, :from 3, :to 1, :committed true}`) and three of six nodes committed
+`POST /v1/cluster/leave`, were wiped and rejoined. `:placement-before` and `:placement-after` were
+byte-identical on every nemesis operation for 900 s.
 
-In the 900 s scale-down job, with the rebalancer enabled — the server's own
-`/v1/cluster/placement` reports `:rebalancer true` on every node in all 296
-samples, and the startup banner appears on all 11 boots:
+The cause is in the fix's own flag documentation: the placement pass was coupled to the leader
+balancer, and `--raft-placement-pass-interval` is now *"independent of raft-leader-balancer-interval:
+placement runs with the leader balancer disabled"*. This harness never enabled the balancer, so no
+pass ever ran.
 
-* a per-range override **committed** — `:set-rf {:partition 5, :from 3, :to 1,
-  :committed true, :accepted-by "n4"}` — and the planner never trimmed the range;
-* three of six nodes were gracefully decommissioned (`:outcome "Committed"`,
-  HTTP 200, stopped and wiped) and rejoined, and their ranges were never
-  re-replicated. The map went on listing departed nodes as voters;
-* `:placement-before` and `:placement-after` are byte-identical on every nemesis
-  op: `[generation 1, 3 voters, 0 transitional]` for all 8 partitions.
+**Every workload check in all ten jobs passed.** Without the vacuity gate all of them would have
+gone green and "placement validated" would have been the conclusion — the third time this repository
+would have shipped runs that proved nothing while reporting health. Read that as the argument for
+the gate, not for the checker being clever: the checker returned `:unknown`, not `false`, because it
+could not distinguish "the planner is broken" from "the planner decided nothing needed moving". It
+refused to conclude, and refusing was enough.
 
-Two independent sources agree — the sampled placement tables and the server's own
-logs (`Stopped hosting` 0, `Imported whole-partition state` 0). `Started hosting`
-is 11, which is one per boot and nothing to do with movement.
+### Confirmed fixed
 
-The verdict is `:unknown`, not `false`, and that is the correct call: the checker
-can say nothing was exercised, but it cannot distinguish "the planner is broken"
-from "the planner decided nothing needed moving". Given a committed override to
-RF 1 and half the roster leaving, the latter is hard to defend — but that
-judgement belongs in the server repo, where it is filed.
+Run `32049527245` shows real movement in every placement job — 32 replica changes and 20 Learners in
+the `lock` job alone, 52 `Stopped hosting`, and moves across all 8 partitions. Graceful leaves now
+**drain** first, evacuating replicas onto survivors before the removal commits.
 
-**This is what the vacuity gate was built for.** Every workload check in all five
-jobs passed. Without the gate, all five would have gone green and "placement
-validated" would have been the conclusion — the third time this repository would
-have shipped runs that proved nothing while reporting health.
+## Closed: the compaction profile never fired, because the threshold is per partition
 
-Still open from the original prerequisites: **the RF-0 baseline is green but the
-follower term-adoption fix remains unconfirmed** (open above). Placement adds
-forwarding, seeding and purging to every operation's path; attributing a failure
-to it while that is outstanding is the mistake this file already records twice.
+**Found by run `32049527245`; a harness bug, not a server one.** Four of five placement jobs failed
+on `:missing [:seeding]`: moves and purges were healthy (`:move 32`, `:purge 52` in the `lock` job)
+while `imported 0` — every Learner caught up by log backfill and `PartitionStateTransfer` was never
+entered, which is the one thing `--force-compaction` exists to force.
+
+`RaftWriteAhead` is constructed **per partition** and decrements its counter once per committed
+operation *on that partition*. `--raft-compact-every-operations 200` therefore meant 200 operations
+on a single Raft group, and `--partitions 8` divides the traffic eight ways before the knob ever
+sees it. The `lock` job commits roughly 640 operations over 600 s — about 80 per partition — so
+compaction never ran once and no floor ever advanced.
+
+The discriminator was already in the results and is worth keeping as the diagnostic: the only jobs
+reaching `imported > 0` were the ones with the heaviest per-partition write volume. `append`, whose
+2PC writes several entries per transaction across participants, got `imported 4`; the 900 s
+`register` RF 3 job got `imported 1`; the low-write `lock` and short `register` jobs got 0.
+
+Lowered to 20, with the arithmetic recorded in `compaction-args`. Precision is not needed and would
+be false: a *fresh* Learner is below the floor as soon as compaction has run even once on its
+partition, so the requirement is only that the threshold fire early, not that it hit a value.
+
+**The general lesson, since this is the second time:** a threshold expressed in operations is
+divided by however many Raft groups the traffic is spread across, and `--partitions 8` is part of
+this profile. Calibrating one against a cluster-wide op count will always be wrong by that factor.
+
+## Open: range splits fail their bulk copy under replica placement
+
+Filed as `a0e95736` to be investigated, **not** as an established defect. From run `32049527245`:
+
+| Job | RF | Placement active | Split outcomes |
+|---|---|---|---|
+| `register / partition,kill,range` | 0 | no | **6 Succeeded, 0 failed** |
+| `register / partition,kill,placement,range` | 3 | yes | 1 Succeeded, **5 TransferFailed** |
+| `append / partition,placement,range` | 3 | yes | 0 Succeeded, **5 TransferFailed** |
+
+Ten of twelve attempts at RF 3 failed in the copy phase, against six of six clean at RF 0 with the
+same nemesis and the same `partition,kill` faults. A split copies onto the *destination partition's*
+Raft log, and that partition was created seconds earlier and is being given a replica set by the
+placement controller while the copy runs — which is exactly the interaction scenario 8 exists to
+probe.
+
+Twelve attempts is not a result, both RF 3 jobs also carry `partition`, and `TransferFailed` is
+`determinate: false` by contract — the harness files it apart from refusals so a run cannot
+manufacture a finding from it. The two control runs that would settle it (RF 3 + `placement,range`
+with no network fault; RF 3 + `partition,range` with nothing moving) are named in the spec.
 
 ## Closed: "mutual exclusion violated" was a bug in *this* checker
 

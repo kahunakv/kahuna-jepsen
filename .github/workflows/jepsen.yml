@@ -323,6 +323,12 @@ jobs:
             nodes: n1,n2,n3,n4,n5,n6
             concurrency: 6
             ops_per_key: 60
+            # A range can only be split where there are keys on both sides of
+            # the cut, so the size of the key space bounds how many times it can
+            # ever be split. At the default of 5 this job ran out of bisection
+            # points almost immediately -- 16 of 22 range operations skipped
+            # with :no-split-key -- and could not demonstrate a split at all.
+            key_count: 25
             time_limit: 900
             partitions: 8
             replication_factor: 3
@@ -452,6 +458,7 @@ jobs:
             --concurrency ${{ matrix.concurrency }} \
             --concurrency-per-key ${{ matrix.concurrency_per_key || 3 }} \
             --ops-per-key ${{ matrix.ops_per_key }} \
+            --key-count ${{ matrix.key_count || 5 }} \
             --nemesis-interval ${{ matrix.nemesis_interval || 15 }} \
             --membership-interval ${{ matrix.membership_interval || 60 }} \
             --revision-retention ${{ matrix.revision_retention || 0 }} \

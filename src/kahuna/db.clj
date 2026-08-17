@@ -151,10 +151,33 @@
   the log and `PartitionStateTransfer` is never entered: a profile whose
   checkpoints never fire silently validates nothing about snapshot seeding.
 
+  ## The operation count is per partition, and that is the whole calibration
+
+  `RaftWriteAhead` is constructed per partition and decrements its counter once
+  per committed operation *on that partition*. So the threshold is not divided
+  by the cluster's write rate, it is divided by the write rate **per Raft
+  group** — and `--partitions 8` splits the traffic eight ways before this knob
+  ever sees it.
+
+  This was originally 200, which is above what a low-write workload reaches on
+  any single partition inside a run: the `lock` job commits roughly 640
+  operations over 600 s, or ~80 per partition, so compaction never ran once, no
+  floor ever advanced, and every learner backfilled from the log. Four of five
+  placement jobs failed on `:missing [:seeding]` for that reason alone, while
+  `append` — whose 2PC writes several entries per transaction across
+  participants — was the only workload that reached the threshold and the only
+  one that produced a snapshot seed.
+
+  20 is chosen to clear the lowest-traffic partition in the matrix by a wide
+  margin. Precision is not needed and would be false: a *fresh* learner starts
+  below the floor as soon as compaction has run even once on its partition, so
+  the requirement is only that the threshold be small enough to fire early
+  rather than that it hit any particular value.
+
   The cost is that these settings destroy the point-in-time recovery window, so
   they belong to a chaos profile and nowhere near a real deployment."
-  [:--raft-compact-every-operations 200
-   :--raft-compact-number-entries   100
+  [:--raft-compact-every-operations 20
+   :--raft-compact-number-entries   20
    :--pitr-window                   1
    :--base-snapshot-interval        1])
 
