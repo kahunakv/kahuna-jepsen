@@ -290,6 +290,32 @@ jobs:
             time_limit: 600
             partitions: 3
             key_range: true
+          # Control for `fe248fe4` (write skew under key-range routing). The
+          # G2-item was found by `append / partition,placement,range` at RF 3,
+          # and the split was excluded as its cause by timestamp -- the cycle
+          # preceded the run's only successful split by ~93 seconds. What is
+          # left to test is key-range routing itself, which is not "the same job
+          # plus splits": registering the key space puts every append key on one
+          # whole-space descriptor from t=0, so multi-key transactions become
+          # single-partition and reads take the descriptor router instead of the
+          # hash locator.
+          #
+          # So this job strips everything else away -- RF 0, no network fault,
+          # no placement, no kills -- and leaves key-range routing and the split
+          # nemesis. If G2-item reproduces here, the anomaly belongs to routing
+          # alone and neither placement nor the network is involved. If it does
+          # not, the next control adds `partition` back.
+          #
+          # key_count matches the failing job so the transaction shape is the
+          # same; only the variable under test differs.
+          - workload: append
+            faults: range
+            concurrency: 5
+            ops_per_key: 60
+            time_limit: 600
+            partitions: 8
+            key_count: 25
+            key_range: true
           # Scenario 8 proper: split and merge under a replication factor with
           # concurrent writers. The copy goes through the destination
           # partition's Raft log, so a kill landing right after cutover is the

@@ -283,3 +283,29 @@
                     [(sample 0 steady) (sample 1000 two)])]
     (is (false? (:valid? r)))
     (is (contains? (set (map :type (:violations r))) :multiple-movers))))
+
+(deftest a-run-that-started-moves-and-finished-none-is-stalled-not-vacuous
+  ;; Learners appear and no voter set ever changes. That is not an idle
+  ;; nemesis, it is moves that begin and never complete — the shape an RF 1
+  ;; kill-heavy run produces, because a range with a single voter has no
+  ;; surviving copy to seed a replacement from while that voter is down.
+  ;; Reporting it as :vacuous would file "the planner is stuck" under "the
+  ;; nemesis did nothing".
+  ;; `moving` is the mid-move fixture: generation 2, the three original voters
+  ;; plus n4 as a Learner. Ending the history there — rather than following it
+  ;; with `moved` as the passing test does — is a move that began and never
+  ;; finished. It must carry a *new* generation: reusing generation 1 with a
+  ;; different replica set is a map disagreement, which fails the run before the
+  ;; vacuity gate is ever consulted.
+  (let [r (check* base-test [(sample 0 steady) (sample 1000 moving)])]
+    (is (= :unknown (:valid? r)))
+    (is (= :stalled (:cause r)))
+    (is (= [:move] (:missing r)))
+    (is (= 1 (get-in r [:transitional :learners])))))
+
+(deftest a-run-with-no-transitional-replica-at-all-is-still-vacuous
+  ;; The accepting twin for the distinction: nothing was ever attempted, so
+  ;; :vacuous remains the right word and :stalled must not swallow it.
+  (let [r (check* base-test [(sample 0 steady) (sample 1000 steady)])]
+    (is (= :unknown (:valid? r)))
+    (is (= :vacuous (:cause r)))))

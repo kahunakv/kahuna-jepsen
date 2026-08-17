@@ -339,6 +339,16 @@
    :unhosted "Stopped hosting"
    :imported "Imported whole-partition state of partition"
    :exported "Exported whole-partition state of partition"
+   ;; Diagnostic only — never evidence. These exist because `:seeding 0` has
+   ;; three very different causes and the harness spent two runs guessing
+   ;; between them: compaction never ran (the threshold is per partition and the
+   ;; workload never reached it), compaction ran but freed nothing, or
+   ;; compaction was refused because the application-durability floor had not
+   ;; advanced. The first is a harness calibration bug, the third is a server
+   ;; condition, and a run that reports only `imported 0` cannot tell them apart.
+   :compaction-started "Compaction process started"
+   :compaction-done    "Compaction finished"
+   :compaction-blocked "Compaction blocked by application-durability floor"
    ;; The trailing space is load-bearing and must not be tidied away.
    ;; `RangeSplitTrigger` logs two messages: \"RangeSplitTrigger: splitting
    ;; {Space} [{Start},{End}) at {Key}\" before it starts, and
@@ -490,10 +500,11 @@
     something.
   * `:valid? false` — a safety property broke. `:violations` and
     `:disagreements` say which and where.
-  * `:valid? :unknown` — nothing was proven. Either the run never moved a
-    replica (`:cause :vacuous`) or it could not be observed (`:cause
-    :unmeasured`). Read this as 'run it again with the placement nemesis on',
-    never as a pass.
+  * `:valid? :unknown` — nothing was proven, with three causes worth telling
+    apart. `:vacuous` means the run never moved a replica; `:stalled` means it
+    added Learners and completed no move, which is a different and more
+    interesting failure; `:unmeasured` means it could not be observed at all.
+    Read any of them as 'this run settled nothing', never as a pass.
 
   At replication factor 0 this returns `:valid? true` and makes no claim:
   full replication has no replica sets to place, and every property above is
@@ -546,7 +557,21 @@
                         :missing missing)
 
             (seq missing)
-            (assoc base :valid? :unknown :cause :vacuous :missing missing)
+            (assoc base :valid? :unknown
+                        ;; A run that added Learners and completed no move is
+                        ;; not the same as one where nothing was ever attempted,
+                        ;; and calling both `:vacuous` hides the more
+                        ;; interesting of the two. At RF 1 in particular a move
+                        ;; needs the range's single voter alive to seed from, so
+                        ;; a kill-heavy run can start moves it can never finish
+                        ;; — which is a fact about that configuration, not an
+                        ;; idle nemesis.
+                        :cause (if (and (some #{:move} missing)
+                                        (pos? (+ (:learners roles 0)
+                                                 (:removings roles 0))))
+                                 :stalled
+                                 :vacuous)
+                        :missing missing)
 
             :else
             (assoc base :valid? true :shown shown)))))))

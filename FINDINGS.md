@@ -192,6 +192,82 @@ Twelve attempts is not a result, both RF 3 jobs also carry `partition`, and `Tra
 manufacture a finding from it. The two control runs that would settle it (RF 3 + `placement,range`
 with no network fault; RF 3 + `partition,range` with nothing moving) are named in the spec.
 
+## Open: fencing tokens go backwards and get reused under replica placement
+
+Filed as `01d4a5cf`. From run `32051818625`, `lock / partition,placement` at RF 3 — a
+**`:valid? false`**, not a vacuity refusal:
+
+```clojure
+:fencing {:valid? false, :acquire-count 403, :max-token 400,
+          :violations (4× :token-went-backwards, 1× :token-reused-by-other-owner)}
+```
+
+Fencing token **291 was granted to two different owners** — `0846e800` on n6, then `b06e7ded` on n1
+eleven seconds later. `:max-token 400` against `:acquire-count 403` says the same thing in
+aggregate: fewer distinct tokens issued than acquisitions granted. Mutual exclusion held
+(`:exclusion {:valid? true, :hold-count 229}`); the fencing contract did not.
+
+Placement is the differentiator. In the same run on the same build, `lock / partition`,
+`lock / partition` at interval 5, `lock / partition,kill` and `lock / pause` all passed. The failing
+job is the only one with the placement fault and the only one at a replication factor, and it moved
+19 replicas with 21 Learners across all 8 partitions while the workload ran.
+
+**This class has been fixed twice here and verified both times** — "roll back under partition alone"
+(16 of 16) and "regressed under partition + kill". Neither fix was ever exercised against replica
+movement, because until kahuna `09c99a1` the placement controller moved nothing at all. This is the
+first run in which a lock partition's replica set changed underneath live lock traffic.
+
+## Open: write skew (`:G2-item`) under key-range routing — and it is not the split
+
+Filed as `fe248fe4`. From run `32051818625`, `append / partition,placement,range` at RF 3: a
+textbook write skew, T1 appending 22 while reading 24 empty and T2 reading 22 empty while appending
+24.
+
+**The split did not cause it, and that is the part worth remembering.** The obvious reading — a
+range split moving a key mid-transaction, exactly the window scenario 8 predicts — is excluded by
+the timestamps: first client transaction 17:48:48.08, anomaly at history time 5.4 s ≈ 17:48:53, the
+run's only successful split at 17:50:26.86. The cycle precedes any split by ~93 seconds, the map
+held a single whole-space descriptor throughout, and both keys sit ordinally below the eventual
+boundary anyway. That hypothesis was tried first and is written down here so it is not tried again.
+
+What does distinguish the job is `--key-range` itself, which is *not* "the same job plus splits": it
+registers the key space for key-order routing before any client starts, so from t=0 every
+`jepsen/append/*` key is served by one whole-space descriptor on a single partition rather than
+hash-spread across eight. Every multi-key transaction becomes single-partition, and reads take the
+descriptor router instead of the hash locator. `append / partition`, `append / partition,kill` and
+`append / partition,placement` all passed in the same run.
+
+n = 1, and `partition` and `placement` are both still in play. The spec names the control run that
+would settle it: `append / range` at RF 0, no other faults.
+
+## Open: snapshot seeding still does not fire for most workloads
+
+Lowering `--raft-compact-every-operations` from 200 to 20 (above) helped but did not close it.
+Run `32051818625`: `register / partition,kill,placement` went from red to green and the append
+key-range job reached `imported 8`, but four jobs still report `:missing [:seeding]` at
+`imported 0`.
+
+Rather than guess a third threshold, the placement checker now counts Kommander's own compaction
+lines, which separate the three causes that `imported 0` currently conflates:
+
+| marker | means |
+|---|---|
+| `Compaction process started` | the threshold was reached at all |
+| `Compaction finished Removed=…` | a pass ran to completion |
+| `Compaction blocked by application-durability floor` | the floor never advanced, so nothing could be freed |
+
+If `:compaction-started` is 0 the threshold is still too high for that workload's per-partition
+write rate. If it is non-zero and `:compaction-blocked` is too, the WAL cannot shrink regardless of
+the threshold and this is a server condition rather than a calibration one. The next run answers it
+without another guess.
+
+Related: `register / kill,placement` at **RF 1** reports `:learners 4` with `:replicas-gained 0` —
+moves started and none completed. That is now reported as `:cause :stalled` rather than `:vacuous`,
+because "the planner is stuck" and "the nemesis did nothing" are different findings and the old
+wording filed the first under the second. At RF 1 a range has one voter, so a replacement has
+nothing to seed from while that voter is down; whether the stall is inherent to the configuration or
+a defect is open.
+
 ## Closed: "mutual exclusion violated" was a bug in *this* checker
 
 For a while this was recorded here as the most serious finding in the project:
