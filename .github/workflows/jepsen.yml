@@ -186,12 +186,152 @@ jobs:
             ops_per_key: 30
             time_limit: 900
             membership_interval: 60
+          # ── Replication factor ────────────────────────────────────────────
+          #
+          # Six nodes, eight partitions, RF 3: each range lives on half the
+          # cluster, so placement is doing real work and a node can leave
+          # without the survivors being forced straight back into full
+          # replication. Five nodes at RF 3 would be much closer to the legacy
+          # mode and would hide exactly the routing this profile exists to
+          # exercise -- the Jepsen client targets nodes directly, so most
+          # operations land on a node that does not host the key and have to be
+          # forwarded.
+          #
+          # `force_compaction` is not optional here even though it reads like a
+          # tuning knob. Without it the PITR floor protects the last 90 minutes
+          # of WAL, nothing is ever compacted inside a run, and every replica
+          # added by the nemesis catches up from the log --
+          # `PartitionStateTransfer` is never entered and the snapshot-seeding
+          # path is untested while the job goes green. The placement checker
+          # would return :unknown rather than let that pass, which is the
+          # intended safety net, but the point is to actually test it.
+          #
+          # The budgets are long because a replica move is not instantaneous: an
+          # add, a seed, a promotion that waits out the learner stable window,
+          # and two more committed map changes, at one in-flight transfer per
+          # range. At 180 s these jobs would land one or two moves.
+          - workload: register
+            faults: partition,kill,placement
+            nodes: n1,n2,n3,n4,n5,n6
+            concurrency: 8
+            concurrency_per_key: 2
+            ops_per_key: 40
+            kill_targets: one,majority
+            time_limit: 600
+            partitions: 8
+            replication_factor: 3
+            force_compaction: true
+          - workload: append
+            faults: partition,placement
+            nodes: n1,n2,n3,n4,n5,n6
+            concurrency: 6
+            ops_per_key: 60
+            time_limit: 600
+            partitions: 8
+            replication_factor: 3
+            force_compaction: true
+          - workload: lock
+            faults: partition,placement
+            nodes: n1,n2,n3,n4,n5,n6
+            concurrency: 10
+            ops_per_key: 60
+            time_limit: 600
+            partitions: 8
+            replication_factor: 3
+            force_compaction: true
+          # RF 1 is the cheapest high-signal configuration there is: with one
+          # replica per range, a placement bug is data loss rather than
+          # degradation, and there is no second copy to paper over a purge that
+          # ran too early or a seed that arrived incomplete. It is also the
+          # profile where a repair is unavoidable -- kill the node holding a
+          # range and the planner has to rebuild it somewhere else from nothing.
+          - workload: register
+            faults: kill,placement
+            nodes: n1,n2,n3,n4,n5,n6
+            concurrency: 9
+            ops_per_key: 40
+            kill_targets: one
+            time_limit: 600
+            partitions: 8
+            replication_factor: 1
+            force_compaction: true
+          # Scale-down: walk the roster from six nodes toward the replication
+          # factor and back. The planner must degrade toward fuller replication
+          # rather than lose ranges, and the last-voter refusal has to hold. One
+          # pass costs several minutes -- a leave commits, the node is wiped, and
+          # a rejoin backfills from scratch -- hence the budget.
+          - workload: register
+            faults: placement
+            nodes: n1,n2,n3,n4,n5,n6
+            concurrency: 9
+            ops_per_key: 30
+            time_limit: 900
+            partitions: 8
+            replication_factor: 3
+            placement_nodes_out: 3
+            placement_interval: 45
+            force_compaction: true
+          # Key-range routing. `key_range` registers the workload's key space
+          # for key-order routing before the run starts and enables the `range`
+          # fault, which forces a split every ~20 s by scanning a range for a
+          # median key -- the only thing that moves a boundary inside a run,
+          # since auto-split fires at 1000 sampled keys on a 60 s cadence.
+          #
+          # The first job is deliberately at the default replication factor: it
+          # isolates the split transaction (create, quiesce, copy, cutover) from
+          # replica placement, so a failure here is about ranges and not about
+          # where their replicas live. Cheap, five nodes, and the one to look at
+          # first when the RF 3 job below goes red.
+          - workload: register
+            faults: partition,kill,range
+            concurrency: 9
+            ops_per_key: 40
+            kill_targets: one,majority
+            time_limit: 600
+            partitions: 3
+            key_range: true
+          # Scenario 8 proper: split and merge under a replication factor with
+          # concurrent writers. The copy goes through the destination
+          # partition's Raft log, so a kill landing right after cutover is the
+          # test -- and the destination is a partition that did not exist when
+          # the run started, which is what makes this different from every other
+          # job in this matrix.
+          - workload: register
+            faults: partition,kill,placement,range
+            nodes: n1,n2,n3,n4,n5,n6
+            concurrency: 8
+            concurrency_per_key: 2
+            ops_per_key: 40
+            kill_targets: one,majority
+            time_limit: 900
+            partitions: 8
+            replication_factor: 3
+            key_range: true
+            force_compaction: true
+          # 2PC across a boundary that moves underneath it. A transaction whose
+          # micro-ops span a range being split has to see one map or the other,
+          # never half of each -- the prepare is routed per key, so a cutover
+          # between two prepares is the window. Elle is what would notice.
+          - workload: append
+            faults: partition,range
+            nodes: n1,n2,n3,n4,n5,n6
+            concurrency: 6
+            ops_per_key: 60
+            time_limit: 900
+            partitions: 8
+            replication_factor: 3
+            key_range: true
+            force_compaction: true
 
     env:
       KAHUNA_REPO: ${{ inputs.kahuna_repo || 'kahunakv/kahuna' }}
       KAHUNA_REF:  ${{ inputs.kahuna_ref  || 'main' }}
       TIME_LIMIT:  ${{ inputs.time_limit  || '180' }}
       RATE:        ${{ inputs.rate        || '10' }}
+      # Which containers this job starts and which nodes the test runs against —
+      # one value, so the two can never drift apart. The compose file defines
+      # six; a job that names five leaves n6 unbuilt rather than idling.
+      NODES:       ${{ matrix.nodes || 'n1,n2,n3,n4,n5' }}
 
     steps:
       - name: Check out test suite
@@ -256,31 +396,44 @@ jobs:
             >> ~/.ssh/config
 
       - name: Start Kahuna nodes
-        # Only n1..n5 — on a Linux runner the host reaches container IPs
-        # directly, so Jepsen runs on the runner itself and the control
-        # container is unnecessary.
-        run: docker compose -f docker/compose.yml up -d --build n1 n2 n3 n4 n5
+        # Only the nodes this job uses — on a Linux runner the host reaches
+        # container IPs directly, so Jepsen runs on the runner itself and the
+        # control container is unnecessary.
+        run: docker compose -f docker/compose.yml up -d --build ${NODES//,/ }
 
       - name: Map node names to container IPs
         run: |
-          for n in n1 n2 n3 n4 n5; do
+          for n in ${NODES//,/ }; do
             ip="$(docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' "jepsen-$n")"
             echo "$ip $n" | sudo tee -a /etc/hosts
           done
-          for n in n1 n2 n3 n4 n5; do
+          for n in ${NODES//,/ }; do
             until ssh -o ConnectTimeout=2 root@"$n" true 2>/dev/null; do sleep 1; done
             echo "$n reachable"
           done
 
-      - name: Run ${{ matrix.workload }} / ${{ matrix.faults }} @ interval ${{ matrix.nemesis_interval || 15 }}
+      - name: Run ${{ matrix.workload }} / ${{ matrix.faults }} @ rf ${{ matrix.replication_factor || 0 }}, interval ${{ matrix.nemesis_interval || 15 }}
         # jepsen.cli exits non-zero when the checker returns :valid? false, so
         # no result parsing is needed here.
+        #
+        # The placement flags are rendered on every job. At the default
+        # replication factor of 0 they are all inert — the server command line
+        # gains nothing, the placement nemesis and sampler disable themselves,
+        # and the placement checker makes no claim — so the legacy jobs above
+        # run exactly the cluster they ran before. The same holds for
+        # --range-interval, which is inert unless the `range` fault is on.
+        #
+        # --force-compaction and --key-range are the two exceptions: both are
+        # switches, so they are present or absent rather than carrying a value.
+        # --key-range is the one flag here that changes what the cluster *does*
+        # rather than only what the harness does -- it registers the workload's
+        # key space for key-order routing before any client starts.
         run: |
           lein with-profile +ci run test \
             --workload ${{ matrix.workload }} \
             --faults ${{ matrix.faults }} \
             --kill-targets ${{ matrix.kill_targets || 'one,majority,all' }} \
-            --nodes n1,n2,n3,n4,n5 \
+            --nodes "$NODES" \
             --time-limit ${{ matrix.time_limit || env.TIME_LIMIT }} \
             --rate "$RATE" \
             --concurrency ${{ matrix.concurrency }} \
@@ -290,13 +443,20 @@ jobs:
             --membership-interval ${{ matrix.membership_interval || 60 }} \
             --revision-retention ${{ matrix.revision_retention || 0 }} \
             --revision-cleanup-interval ${{ matrix.revision_cleanup_interval || 300 }} \
+            --partitions ${{ matrix.partitions || 3 }} \
+            --replication-factor ${{ matrix.replication_factor || 0 }} \
+            --placement-interval ${{ matrix.placement_interval || 30 }} \
+            --placement-nodes-out ${{ matrix.placement_nodes_out || 1 }} \
+            --range-interval ${{ matrix.range_interval || 20 }} \
+            ${{ matrix.force_compaction && '--force-compaction' || '' }} \
+            ${{ matrix.key_range && '--key-range' || '' }} \
             --tarball target/kahuna.tar.gz
 
       - name: Collect server logs
         if: always()
         run: |
           mkdir -p store/docker-logs
-          for n in n1 n2 n3 n4 n5; do
+          for n in ${NODES//,/ }; do
             docker logs "jepsen-$n" > "store/docker-logs/$n.docker.log" 2>&1 || true
           done
 

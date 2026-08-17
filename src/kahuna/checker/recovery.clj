@@ -45,12 +45,28 @@
   "Each fault's beginning :f mapped to the :f that ends it.
 
   `:kill`/`:start` is jepsen.nemesis.combined's db-nemesis, `:pause`/`:resume`
-  is SIGSTOP/SIGCONT, `:start-partition`/`:stop-partition` is the network, and
-  `:leave`/`:join` is this suite's membership nemesis."
+  is SIGSTOP/SIGCONT, `:start-partition`/`:stop-partition` is the network,
+  `:leave`/`:join` is this suite's membership nemesis, and
+  `:decommission`/`:recommission` is the placement nemesis taking a node out of
+  the roster and putting it back.
+
+  The placement nemesis's `:set-rf`/`:clear-rf` are deliberately absent. They
+  change a placement *target* without removing any capacity — the cluster is
+  fully available throughout — so counting them as faults would close recovery
+  windows that never needed to recover and drag the median toward zero.
+
+  The range nemesis's `:split-range`/`:merge-ranges` are absent for a weaker
+  reason, and it is a caveat rather than a decision: a split does quiesce its
+  source range for the cutover, so a window measured across one carries that
+  pause. But a quiesce is bounded and range-local, it has no ending op to pair
+  with, and treating it as a fault would open a recovery window per split on a
+  cluster that never lost capacity. The number this checker reports is already
+  documented as an upper bound; on key-range runs it is slightly looser."
   {:kill            :start
    :pause           :resume
    :start-partition :stop-partition
-   :leave           :join})
+   :leave           :join
+   :decommission    :recommission})
 
 (def fault-start-fs (set (keys fault-pairs)))
 (def fault-end-fs   (set (vals fault-pairs)))

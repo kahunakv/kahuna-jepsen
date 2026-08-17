@@ -1,8 +1,15 @@
 name: kahuna-jepsen
 
-# Five Kahuna nodes plus a control node, all on one bridge network so the
-# control node can resolve n1..n5 by name. Nodes are privileged because the
+# Six Kahuna nodes plus a control node, all on one bridge network so the
+# control node can resolve n1..n6 by name. Nodes are privileged because the
 # nemesis manipulates iptables (partitions) and, optionally, the clock.
+#
+# Six, not five, because of the replication-factor profile: at RF 3 a six-node
+# cluster stores each range on half its nodes, which is the configuration where
+# placement is doing real work and where a node can be decommissioned without
+# the survivors immediately being forced back into full replication. Nothing
+# obliges a run to use all of them -- `--nodes n1,n2,n3,n4,n5` is still the
+# five-node cluster every existing job runs against, and n6 simply idles.
 
 x-node: &node
   build:
@@ -34,7 +41,7 @@ services:
       - "8080:8080"
     networks:
       - jepsen
-    depends_on: [n1, n2, n3, n4, n5]
+    depends_on: [n1, n2, n3, n4, n5, n6]
 
   n1:
     <<: *node
@@ -60,6 +67,11 @@ services:
     <<: *node
     container_name: jepsen-n5
     hostname: n5
+
+  n6:
+    <<: *node
+    container_name: jepsen-n6
+    hostname: n6
 
 networks:
   jepsen:

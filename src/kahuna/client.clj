@@ -15,6 +15,7 @@
   reverse hides real ones."
   (:require [cheshire.core :as json]
             [clj-http.client :as http]
+            [clojure.string :as str]
             [clojure.tools.logging :refer [info warn]])
   (:import (java.util Base64)))
 
@@ -170,6 +171,28 @@
     (if (map? body)
       (assoc body :status (:status resp))
       {:type nil :status (:status resp) :body body})))
+
+(defn post*
+  "POSTs `body` as JSON to `path` on `node`, returning {:status int :body parsed}
+  *without* flattening the body to the top level.
+
+  Use this — not `post!` — when the response carries a field of its own named
+  `status`. `KahunaSetReplicationFactorResponse` does: it reports the commit
+  outcome (`Success`, `Refused`, …) there, and flattening would replace it with
+  the HTTP status code, so a refusal would read as the number 409 rather than as
+  the reason it was refused."
+  ([node path body] (post* node path body {}))
+  ([node path body opts]
+   (let [timeout (:timeout opts 5000)
+         resp    (http/post (str (base-url node) path)
+                            {:body               (json/generate-string body)
+                             :content-type       :json
+                             :accept             :json
+                             :socket-timeout     timeout
+                             :connection-timeout timeout
+                             :throw-exceptions   false
+                             :as                 :json})]
+     {:status (:status resp) :body (:body resp)})))
 
 (defn post!
   "POSTs `body` as JSON to `path` on `node`. Returns the parsed body map with
@@ -497,3 +520,283 @@
   request and being refused."
   [node]
   (get! node "/v1/cluster/health" {:timeout 2000}))
+
+;; ---------------------------------------------------------------------------
+;; Per-partition replica placement (used by the placement nemesis and checker;
+;; see src/kahuna/nemesis/placement.clj and src/kahuna/checker/placement.clj)
+;; ---------------------------------------------------------------------------
+
+(defn- replica-role
+  "Normalizes a wire role name to a keyword: Voter/Learner/Removing become
+  :voter/:learner/:removing. An unknown role keywordizes rather than being
+  dropped — a role this harness has never seen is exactly the thing a placement
+  checker must not silently ignore."
+  [s]
+  (when s (keyword (str/lower-case s))))
+
+(def transitional-roles
+  "Roles that mean a replica is mid-move. Kommander's placement service enforces
+  at most one of these per range (`ReplicaPlacementService`, \"single mover per
+  range\"), which is what makes successive committed configurations overlap by a
+  quorum. Observing two at once on one range is a safety violation, not churn."
+  #{:learner :removing})
+
+(defn cluster-placement
+  "Reads /v1/cluster/placement — the committed per-partition replica map, as seen
+  by `node`. Returns nil when the node cannot answer.
+
+  Every node returns the *same* committed map; only the `:hosted-locally` flags
+  and `:hosted-count` describe the answering node. That is what makes this
+  endpoint usable as a cross-node agreement check: two nodes reporting the same
+  partition at the same `:generation` must report an identical replica set.
+
+  An empty `:replicas` for a partition means legacy full replication (every
+  roster voter hosts it), which is also what an RF-0 cluster reports for
+  everything."
+  [node]
+  (let [r (get! node "/v1/cluster/placement" {:timeout 3000})]
+    (when (= 200 (:status r))
+      {:replication-factor (:replicationFactor r)
+       :rebalancer         (true? (:rebalancerEnabled r))
+       :initialized        (true? (:initialized r))
+       :endpoint           (:localEndpoint r)
+       :hosted-count       (:hostedPartitionCount r)
+       :partitions
+       (into (sorted-map)
+             (map (fn [p]
+                    [(:partitionId p)
+                     {:state          (:state p)
+                      :generation     (:generation p)
+                      :effective-rf   (:effectiveReplicationFactor p)
+                      :hosted-locally (true? (:hostedLocally p))
+                      :replicas       (mapv (fn [x]
+                                              {:endpoint (:endpoint x)
+                                               :role     (replica-role (:role x))})
+                                            (:replicas p))}]))
+             (:partitions r))})))
+
+(defn set-replication-factor!
+  "Commits a per-partition replication-factor override (0 clears it, so the
+  partition inherits the global factor).
+
+  **Leader-only.** Like every partition-map mutation this is accepted by the
+  meta-partition leader alone; a follower answers 409 with the refusing status
+  in the body, so a caller that wants the change to land must try endpoints
+  until one commits. `:success` is the only thing that means committed —
+  `:status` carries the refusal reason and is read straight from the body, which
+  is why this goes through `post*`.
+
+  Success means the *target* moved, not the replicas: the rebalancer converges
+  toward it on later passes, and with the rebalancer off nothing moves at all."
+  [node partition-id rf {:keys [timeout]}]
+  (let [{:keys [status body]} (post* node "/v1/cluster/replication-factor"
+                                     {:partitionId       partition-id
+                                      :replicationFactor rf}
+                                     {:timeout (or timeout 10000)})
+        body (when (map? body) body)]
+    {:success     (true? (:success body))
+     :outcome     (:status body)
+     :generation  (:generation body)
+     :reason      (:reason body)
+     :http-status status}))
+
+(defn cluster-leave!
+  "Decommissions `node`: commits its removal from the roster now, rather than
+  stopping the process and making the cluster infer the departure from silence.
+
+  The node keeps serving its port afterwards so this answer can be read;
+  stopping it is the caller's next step. `:outcome` is the consensus outcome
+  name (`Committed`, `NotAMember`, `RefusedInsufficientVoters`, `NotInitialized`,
+  `NoLeader`, `Timeout`), so — unlike a SIGTERM-and-hope leave — a nemesis can
+  record *why* a removal did not happen instead of inferring it from a roster
+  count."
+  [node {:keys [timeout]}]
+  (let [r (post! node "/v1/cluster/leave" {} {:timeout (or timeout 30000)})]
+    {:left               (true? (:left r))
+     :outcome            (:outcome r)
+     :membership-version (:membershipVersion r)
+     :retryable          (true? (:retryable r))
+     :reason             (:reason r)
+     :http-status        (:status r)}))
+
+;; ---------------------------------------------------------------------------
+;; Key ranges: the range map, and the split/merge admin surface
+;; (used by kahuna.nemesis.range and kahuna.checker.range)
+;;
+;; Every POST here answers with a body carrying its own `status` field — the
+;; outcome name, not the HTTP code — so all of them go through `post*`. Using
+;; `post!` would flatten the body and overwrite that field with 200/400/409,
+;; turning `"BelowMinRangeSize"` into the number 409 and making a refusal
+;; indistinguishable from a mid-cutover failure. That distinction is the entire
+;; reason the endpoints report `determinate` at all.
+;; ---------------------------------------------------------------------------
+
+(defn- range-descriptor
+  "One wire descriptor as `{:start :end :partition :generation}`.
+
+  `:start` and `:end` keep the server's nils, which mean ∓infinity *within the
+  key space* rather than a missing field. Bounds are half-open — `[start, end)`
+  — and compared **ordinally**; `clojure.core/compare` on strings is
+  `String/compareTo`, which is ordinal, so coverage arithmetic on these is
+  sound. A culture-aware comparison would read gaps that are not there."
+  [d]
+  {:start      (:startKey d)
+   :end        (:endKey d)
+   :partition  (:partitionId d)
+   :generation (:generation d)})
+
+(defn range-map
+  "Reads /v1/ranges — the range-descriptor map as `node` has applied it. Returns
+  nil when the node cannot answer.
+
+  Two things travel side by side here and they are not the same kind of fact.
+  The **descriptors** are replicated on the meta partition, so every node
+  converges on them; the **routing mode** is node-local, derived by reconciling
+  the registry against the descriptors this node has applied. So a node that has
+  not applied the map yet honestly reports `Hash` with no descriptors — which is
+  why a checker must ignore empty views rather than read them as a key space
+  going missing.
+
+  Deliberately unfiltered: the `?keySpace=` form reports one space even when
+  nothing knows about it, which is useful for polling a registration, but a
+  checker wants everything the node believes so an unexpected space is visible
+  rather than invisible."
+  [node]
+  (let [r (get! node "/v1/ranges" {:timeout 3000})]
+    (when (= 200 (:status r))
+      {:initialized (true? (:initialized r))
+       :endpoint    (:localEndpoint r)
+       :key-spaces  (into (sorted-map)
+                          (map (fn [ks]
+                                 [(:keySpace ks)
+                                  {:routing-mode (:routingMode ks)
+                                   :descriptors  (mapv range-descriptor (:descriptors ks))}]))
+                          (:keySpaces r))})))
+
+(defn register-key-range!
+  "Puts `key-space` under key-range routing: POST /v1/ranges/register.
+
+  **Not leader-only** — the node forwards the whole-space seed descriptor to the
+  meta-partition leader and waits for it to replicate back, so a follower
+  legitimately succeeds. That wait is why the default timeout here is generous.
+
+  `:seeded` is true only when *this* call committed the seed; `AlreadySeeded` is
+  still a success, just not this call's doing. `Indeterminate` means the mode
+  was flipped locally but no descriptor is visible here yet — it may still
+  arrive, so it is not a failure and must not be retried as one. Read
+  `range-map` before concluding anything."
+  [node key-space {:keys [timeout]}]
+  (let [{:keys [status body]} (post* node "/v1/ranges/register"
+                                     {:keySpace key-space}
+                                     {:timeout (or timeout 20000)})
+        body (when (map? body) body)]
+    {:success          (true? (:success body))
+     :outcome          (:status body)
+     :seeded           (true? (:seeded body))
+     :routing-mode     (:routingMode body)
+     :descriptor-count (:descriptorCount body)
+     :reason           (:reason body)
+     :http-status      status}))
+
+(defn unregister-key-range!
+  "Drops `key-space`'s descriptors from the replicated map: POST
+  /v1/ranges/unregister. Every node's routing mode follows through the normal
+  replication path. Same forwarding contract as `register-key-range!`."
+  [node key-space {:keys [timeout]}]
+  (let [{:keys [status body]} (post* node "/v1/ranges/unregister"
+                                     {:keySpace key-space}
+                                     {:timeout (or timeout 20000)})
+        body (when (map? body) body)]
+    {:success          (true? (:success body))
+     :outcome          (:status body)
+     :routing-mode     (:routingMode body)
+     :descriptor-count (:descriptorCount body)
+     :reason           (:reason body)
+     :http-status      status}))
+
+(defn split-range!
+  "Splits the range covering `split-key` at exactly that key: POST
+  /v1/ranges/split. `[S, E)` becomes `[S, split-key)` and `[split-key, E)`, so
+  the key itself lands in the *upper* half.
+
+  **Leader-only**: a node that does not lead the partition owning the range map
+  answers `NotLeader` without attempting anything, which is safe to retry
+  elsewhere.
+
+  `:determinate` is the field a fault-injection harness must read, and it is
+  not the same question as `:success`. A split is a multi-step transaction —
+  create the destination partition, quiesce the source, copy, commit the
+  cutover — and `TransferFailed` / `QuiesceFailed` / `CutoverFailed` /
+  `ConcurrentSplit` leave the outcome genuinely unknown: the map may change
+  moments after this returns. Retrying one of those against another node would
+  be issuing a second mutation while the first is still in flight, which is
+  precisely how a harness manufactures a finding. `:determinate false` means
+  re-read `range-map`, never 'it failed'.
+
+  An unparsable body reads as `:success false :determinate false` — unknown,
+  which is the only safe default for a mutation whose answer was lost."
+  [node key-space split-key {:keys [timeout]}]
+  (let [{:keys [status body]} (post* node "/v1/ranges/split"
+                                     {:keySpace key-space :splitKey split-key}
+                                     {:timeout (or timeout 60000)})
+        body (when (map? body) body)]
+    {:success        (true? (:success body))
+     :outcome        (:status body)
+     :determinate    (true? (:determinate body))
+     :new-partition  (:newPartitionId body)
+     :new-generation (:newGeneration body)
+     :leader-hint    (:leaderHint body)
+     :reason         (:reason body)
+     :http-status    status}))
+
+(defn merge-ranges!
+  "Runs the merge pass on demand: POST /v1/ranges/merge. Folds adjacent
+  under-min ranges back into one — the same work the periodic checker does.
+
+  Leader-only, and refusing rather than answering 0 is the point: the trigger
+  underneath returns 0 on a non-leader, which reads exactly like 'nothing was
+  eligible'. `NotLeader` here is that ambiguity removed.
+
+  No key-space argument: the pass scans every key-range space and the minimum
+  size it enforces is server configuration (`--range-merge-min-size`), not a
+  request parameter."
+  [node {:keys [timeout]}]
+  (let [{:keys [status body]} (post* node "/v1/ranges/merge" {}
+                                     {:timeout (or timeout 60000)})
+        body (when (map? body) body)]
+    {:success     (true? (:success body))
+     :outcome     (:status body)
+     :determinate (true? (:determinate body))
+     :merges      (:merges body)
+     :leader-hint (:leaderHint body)
+     :reason      (:reason body)
+     :http-status status}))
+
+(defn scan-range
+  "Pages up to `limit` live keys from `[start, end)` under `prefix`, via POST
+  /v1/kv/get-by-range. Returns `{:type kw :keys [str] :has-more bool}`.
+
+  This is how the range nemesis finds a split key that is *known* to have keys
+  on both sides of it. `prefix` is required by the server; nil `start`/`end`
+  mean unbounded, matching a descriptor's ∓infinity bounds exactly, so a
+  descriptor can be handed to this function as-is.
+
+  Reads at `hlc-zero`, the 'latest committed' sentinel — not a very old
+  snapshot. A scan is routed through the covering partitions' leaders, so under
+  a network fault it fails rather than answering from a stale local view."
+  [node prefix start end limit {:keys [timeout]}]
+  (let [r (post! node "/v1/kv/get-by-range"
+                 (cond-> {:prefix         prefix
+                          :limit          limit
+                          :startInclusive true
+                          :endInclusive   false
+                          :transactionId  hlc-zero
+                          :readTimestamp  hlc-zero
+                          :durability     persistent}
+                   start (assoc :startKey start)
+                   end   (assoc :endKey   end))
+                 {:timeout (or timeout 10000)})]
+    {:type     (kv-response-type (:type r))
+     :keys     (into [] (keep :key) (:items r))
+     :has-more (true? (:hasMore r))
+     :status   (:status r)}))

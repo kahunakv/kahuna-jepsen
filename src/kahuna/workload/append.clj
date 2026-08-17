@@ -36,7 +36,17 @@
 ;; TransactionPriority/Normal
 (def priority-normal 2)
 
-(defn- kv-key [k] (str "jepsen/append/" k))
+(def key-space
+  "The Kahuna key space these lists live in. `--key-range` registers this exact
+  string, so it is derived from the same place the keys are.
+
+  Note the transaction coordinator keys (`jepsen/tx/…`) are a *different* key
+  space and stay hash-routed: a coordinator anchor is not data anyone scans by
+  range, and range-routing it would move 2PC bookkeeping around under a split
+  for no reason anyone is testing."
+  "jepsen/append")
+
+(defn- kv-key [k] (str key-space "/" k))
 
 (defn op-id
   "A fresh 128-bit operation id for one micro-op.
@@ -274,7 +284,8 @@
                          :max-txn-length  (:max-txn-length opts 4)
                          :max-writes-per-key (:max-writes-per-key opts 32)
                          :consistency-models [model]})
-           {:client (AppendClient. nil
+           {:key-space key-space
+            :client (AppendClient. nil
                                    (if (= :optimistic (:locking opts))
                                      optimistic
                                      pessimistic)

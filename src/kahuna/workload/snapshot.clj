@@ -66,7 +66,12 @@
             [kahuna.client :as kc]
             [slingshot.slingshot :refer [try+]]))
 
-(defn- kv-key [k] (str "jepsen/snapshot/" k))
+(def key-space
+  "The Kahuna key space these keys live in. `--key-range` registers this exact
+  string, so it is derived from the same place the keys are."
+  "jepsen/snapshot")
+
+(defn- kv-key [k] (str key-space "/" k))
 
 (defmacro with-errors
   "Transport failures become Jepsen ops.
@@ -631,6 +636,7 @@
                       (max 60000 (* 1000 (+ 300 (or (:time-limit opts) 60)))))]
     {:client    (SnapshotClient. nil lease (:snapshot-timeout-ms opts 5000)
                                  (atom {}))
+     :key-space key-space
      :checker   (checker/compose
                   {:stability  (stability-checker lease margin)
                    :leakage    (leakage-checker)

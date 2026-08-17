@@ -38,6 +38,98 @@ Not started:
       `GET /v1/cluster/health` on the server, sampled by
       `kahuna.nemesis.health` and split by the recovery checker into
       `:init-ms` / `:consensus-ms`.
+- [x] replication-factor profile — six nodes, per-partition replica placement,
+      a nemesis that moves replicas (`src/kahuna/nemesis/placement.clj`) and a
+      checker that refuses to call a run that moved nothing a pass
+      (`src/kahuna/checker/placement.clj`). **Built, not yet run** — see below.
+- [x] key-range profile — the workload's key space routed by key order, a
+      nemesis that forces splits and merge passes under load
+      (`src/kahuna/nemesis/range.clj`) and a checker that fails on a gap or an
+      overlap and refuses to call a run that split nothing a pass
+      (`src/kahuna/checker/range.clj`). **Built, not yet run** — see below.
+
+## Open: the key-range profile has never been run
+
+Scenario 8 of the placement spec — split/merge under a replication factor with
+concurrent writers — was recorded here as unreachable, and it was: the split
+thresholds had no server flag, the force-split primitive was `internal`, the
+range map had no read surface, and an ordinary Jepsen key was hash-routed with
+nothing to split. All four are now exposed on `Kahuna.Server`, and `--key-range`
+is the harness half. **No run has been executed against a range-routed
+cluster**, so nothing here is a result yet.
+
+Two failures found while building against the new surface are already fixed
+server-side, and the harness checks the invariant the fix established rather than
+merely hoping for it:
+
+* **Split after a merge.** The next partition id was derived from the range map,
+  which forgets retired partitions, while Kommander keeps them as `Removed` and
+  refuses to recreate one. Auto-split was affected identically, so any key space
+  that had ever been split and merged back failed its next automatic split
+  silently. The split/merge cycle this nemesis runs — two splits per merge pass —
+  walks straight into it, which is why the merge op is in the generator at all.
+* **Split rollback with no merge required.** A split that failed after the
+  partition was created retired the id on cleanup, and the next
+  `ComputeNextPartitionId` returned the same, now-tombstoned, id — wedging the
+  auto-splitter for *every* key space after a single transfer failure.
+* A third, same root cause: with several initial partitions the arithmetic could
+  pick an id inside the hash pool, and `CreatePartitionAsync` answers idempotent
+  success on a live partition — so ranged data joined hash-routed data on one
+  partition with nothing logged. This is the one a run would never have noticed.
+
+The fix allocates one past every id Kommander has ever used, so **a destination
+id is never handed out twice**. The range checker fails a run in which two
+acknowledged splits name the same `newPartitionId`, and reports
+`PartitionCreationFailed` apart from other refusals — that status is what a
+recycled id looks like to a caller. Both read the server's own answers rather
+than the sampled maps: nodes lag, so an id can leave every view and reappear
+from a node that had not caught up, and on a run that churns the roster that
+would fire constantly.
+
+**Expect the first runs to be about the harness.** Every workload here found a
+harness or wire-contract bug before it found a server bug. The specific thing to
+rule out first on a red key-range run is a `:workload` failure with a clean
+`:range` — a cluster where some nodes range-route the space and others hash it
+serves one key from two partitions, and the linearizability checker is what
+would announce that. The DB setup is supposed to make it impossible (registration
+is a precondition and aborts the run rather than proceeding), but "supposed to"
+is what this file is full of.
+
+What a first run should be able to demonstrate, and what the checker reports on
+every key-range run, is `:evidence {:split …}` — either a `Succeeded` cutover
+acknowledged by the server or a sampled layout with more than one descriptor.
+A run without one tested less than its name claims. `--require-range-evidence
+split,merge` additionally demands a merge pass that folded something, which is
+the pairing that exercises the two bugs above.
+
+## Open: the placement profile has never been run
+
+The harness for per-partition replica placement is in the tree and its unit
+tests pass, but **no run has been executed against a placed cluster**, so
+nothing here is a result yet. Two things should happen before one is read as
+one.
+
+**Re-establish the RF-0 baseline first.** Several fixes are still awaiting
+Jepsen confirmation on full replication — the follower term-adoption fix
+(open above), and the snapshot workloads whose only observing runs postdate the
+wire-dialect fix in `27b6363`. Placement adds forwarding, seeding and purging
+to every operation's path; attributing a failure to it while the legacy profile
+is unconfirmed would be exactly the mistake this file has already recorded
+twice.
+
+**Expect the first runs to be about the harness, not about Kahuna.** Every
+workload here found a harness bug or a wire-contract bug before it found a
+server bug, and there is no reason to think a profile this new is different.
+The first thing to check on a red placement run is which of `:workload`,
+`:placement` and `:stats` is false — a `:placement {:valid? :unknown}` is the
+checker saying the run proved nothing, not a violation.
+
+The things a first run should be able to demonstrate, and which the checker
+reports on every placed run, are `:evidence {:move … :seeding … :purge …}` —
+at least one committed replica-set change, at least one
+`Imported whole-partition state` (the snapshot seeding path, reachable only with
+`--force-compaction`; see DESIGN.md) and at least one `Stopped hosting` (the
+un-host purge). A run missing any of them tested less than its name claims.
 
 ## Closed: "mutual exclusion violated" was a bug in *this* checker
 
@@ -1434,11 +1526,14 @@ names lives in another repository and runs on a nightly schedule. The server's
 contract tests and this harness's expectations share no artifact. **A wire
 contract that is asserted independently on both sides is not a contract.**
 
-Two guards worth having, neither built yet:
+Two guards worth having:
 
 * An OpenAPI document checked into `kahuna` and validated against in this repo's
   CI, so a rename fails in the server's own PR rather than here a day later.
-* An observation floor per workload — see the next section.
+  **Not built.**
+* An observation floor per workload. **Built** — `register` was the one workload
+  missing it and now has `observation-checker`; see the next section for that
+  and for the audit of the other four.
 
 ## Harness bugs worth remembering
 
@@ -1454,13 +1549,47 @@ unwritten register is nil. Knossos reads a `nil` read value as *unfilled*, and
 matches it against any state (`knossos/model.clj:79`). So a read the workload
 means as an observation arrives at the checker as an absence of one. 1543
 consecutive blind reads across four jobs certified `:valid? true`; see the
-section above. **Still open** — the rename fix restored the reads but not the
-checker's ability to notice if they stop again. The guard wanted is an
-observation floor on the run, in the shape of `min-protected-reads` in
-`workload/snapshot.clj`: acknowledged writes plus zero non-nil reads is
-`:unknown`, never `true`. Worth reporting `:value-reads` / `:nil-reads` in
-`results.edn` too — that ratio is what made this diagnosable, and it currently
-takes hand-processing the history to get.
+section above.
+
+**Fixed.** Not by changing either decision — both are right — but by stopping the
+two `nil`s from being indistinguishable. `invoke!` now tags every acknowledged
+read with what it saw (`:observed` is `:value`, `:absent` or `:blank`), leaving
+`:value` exactly as `cas-register` needs it, and
+`register/observation-checker` makes the floor a property of the whole run:
+
+```clojure
+:observations {:valid? :unknown, :cause :no-observed-reads,
+               :acked-writes 19, :ok-reads 507, :value-reads 0, :absent-reads 507}
+```
+
+Two shapes are refused. *Acknowledged writes with no observed value* is the
+1543-blind-reads case. *No acknowledged writes at all* is the washout shape
+written up above — previously findable only by counting errors by hand.
+
+The floor is on the run, not on a key: one register legitimately holding nil for
+a whole run is ordinary, and a per-key floor would fail it while missing the
+thing that matters. It is 1 by design — the failure it guards against takes the
+count to exactly zero, and a higher threshold would be guessing at partial
+blindness and going flaky for it. The counts are reported on every run, passing
+or not, because that ratio is what made the original diagnosable and it used to
+take hand-processing the history to get.
+
+Verified by `test/kahuna/workload/register_test.clj`, and the load-bearing test
+there is not of our code: `knossos-certifies-the-blind-history` steps
+`cas-register` through write-3-then-read-nil and asserts it *passes*, then
+asserts the floor rejects the same shape. Deleting the floor therefore fails a
+test that says what was lost, rather than quietly restoring the blind spot.
+
+**The audit that came with it.** Every other workload was checked for the same
+composition — an error mapped to `:ok` with a value the checker treats
+permissively — and register was the only one without a floor:
+
+| workload | mapping | why it was not blind |
+|---|---|---|
+| `append` | `:does-not-exist` → `[:r k nil]` | Elle reads an empty list as a real observation, not a wildcard. The blind day produced *false anomalies* (`:G2-item`, `:internal`, `:lost-update`), which is loud rather than silent. Still worth a read-micro-op counter one day: 4098 nil reads against 0 values looked like an isolation collapse for hours. |
+| `lock` | none — `:busy` and `:lock-does-not-exist` both map to `:fail` | already reports `:acquire-count`; the blind day showed 0 of ~1800 immediately |
+| `sequencer` | none | `:insufficient-data` below 25 allocations |
+| `snapshot` | `:does-not-exist` → `:ok` with nil | `:insufficient-data` below 25 protected reads; the blind day returned `:unknown` at 20 |
 
 **Missing operation ids** made every transaction fail with `InvalidInput`, so
 nothing committed and Elle reported `:empty-transaction-graph`. Every

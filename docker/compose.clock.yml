@@ -20,3 +20,4 @@ services:
   n3: {<<: *clock}
   n4: {<<: *clock}
   n5: {<<: *clock}
+  n6: {<<: *clock}

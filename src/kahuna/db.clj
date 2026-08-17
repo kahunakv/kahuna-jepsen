@@ -12,7 +12,7 @@
                     [util :as util]]
             [jepsen.control.util :as cu]
             [kahuna.client :as kc]
-            [slingshot.slingshot :refer [try+]]))
+            [slingshot.slingshot :refer [try+ throw+]]))
 
 (def dir      "/opt/kahuna")
 (def binary   (str dir "/Kahuna.Server"))
@@ -37,13 +37,156 @@
     (Long/parseLong n)
     (inc (.indexOf ^java.util.List (vec (:nodes test)) node))))
 
+(defn endpoint
+  "This node's Raft endpoint, `host:port` — the identity every placement replica
+  and roster member is named by. The placement table speaks endpoints, the rest
+  of the harness speaks node names, and `endpoint->node` maps back."
+  [node]
+  (str (name node) ":" raft-port))
+
+(defn endpoint->node
+  "Inverse of `endpoint` over a test's node list, or nil for an endpoint that
+  belongs to no known node. Returns nil rather than guessing: a replica on an
+  endpoint this test does not know about is a finding, not a parsing problem."
+  [test ep]
+  (first (filter #(= ep (endpoint %)) (:nodes test))))
+
 (defn peers
   "The --initial-cluster seed list: every node *except* this one, as host:port.
   docker/local.yml in the Kahuna repo excludes self, so we do too."
   [test node]
   (->> (:nodes test)
        (remove #(= % node))
-       (map #(str (name %) ":" raft-port))))
+       (map endpoint)))
+
+(defn replication-factor
+  "The test's configured replication factor, or 0 for full replication. 0 is not
+  merely 'off': it is the legacy mode in which every voter hosts every range and
+  replica sets are empty, and it must stay byte-identical to the pre-placement
+  behaviour."
+  [test]
+  (or (:replication-factor test) 0))
+
+(defn placed?
+  "Is this test running with per-partition placement? Everything placement-shaped
+  — the RF server flags, the placement nemesis, the placement checker's claims —
+  keys off this and degrades to a no-op when it is false, so an RF-0 run is
+  unchanged by any of it."
+  [test]
+  (pos? (replication-factor test)))
+
+(defn zone
+  "This node's zone, or nil when `--zones` is 0. Zones are assigned round-robin
+  over the node list so consecutive nodes land in different zones — with 6 nodes
+  and 3 zones that is two nodes per zone, and the planner then spreads each
+  range's three replicas one per zone, which is the placement a zone outage is
+  supposed to survive."
+  [test node]
+  (let [zones (:zones test 0)]
+    (when (pos? zones)
+      (str "z" (mod (.indexOf ^java.util.List (vec (:nodes test)) node) zones)))))
+
+(defn placement-args
+  "Replication-factor flags for one node's command line.
+
+  Empty at RF 0, which is the point: a run that does not ask for placement must
+  produce exactly the command line it produced before placement existed.
+
+  Booleans are passed as bare switches rather than `--flag true`. CommandLineParser
+  treats a `bool` option as a switch, and every placement flag defaults to false,
+  so presence means on and absence means off. The operations guide writes
+  `--raft-enable-placement-rebalancer true`; the switch form is what the rest of
+  this file already uses (`--raft-allow-insecure-certificate-validation`) and it
+  cannot be mis-tokenized."
+  [test node]
+  (when (placed? test)
+    (concat
+      [:--raft-replication-factor (replication-factor test)]
+      ;; On unless explicitly disabled. Initial placement lands either way; this
+      ;; is the switch for *ongoing* moves — repairing under-replicated ranges,
+      ;; trimming over-replication, smoothing skew. Without it the placement
+      ;; nemesis can change targets all day and nothing will ever move, which is
+      ;; the quietest possible way for this whole suite to test nothing.
+      (when (:rebalancer test true) [:--raft-enable-placement-rebalancer])
+      ;; Load reports are enabled automatically whenever a factor is set; asking
+      ;; for them explicitly costs nothing and makes the intent legible in `ps`.
+      [:--raft-enable-load-reports]
+      (when-let [n (:max-replica-moves-per-pass test)]
+        [:--raft-max-replica-moves-per-pass n])
+      (when-let [n (:max-concurrent-replica-transfers test)]
+        [:--raft-max-concurrent-replica-transfers n])
+      (when-let [n (:replica-count-deadband test)]
+        [:--raft-replica-count-deadband n])
+      (when-let [z (zone test node)]
+        [:--raft-zone z]))))
+
+(def compaction-args
+  "Forces the Raft WAL floor to advance fast enough that a replica added
+  mid-run is *below* it and must be seeded by a whole-partition snapshot rather
+  than by log backfill.
+
+  Three knobs, and all three are needed. `--raft-compact-every-operations`
+  decides how often compaction runs, but compaction cannot discard anything the
+  PITR floor still protects, and that floor sits at `now − pitr-window −
+  base-snapshot-interval` — an hour and a half back by default, which no Jepsen
+  run ever reaches. At the defaults, therefore, every learner catches up from
+  the log and `PartitionStateTransfer` is never entered: a profile whose
+  checkpoints never fire silently validates nothing about snapshot seeding.
+
+  The cost is that these settings destroy the point-in-time recovery window, so
+  they belong to a chaos profile and nowhere near a real deployment."
+  [:--raft-compact-every-operations 200
+   :--raft-compact-number-entries   100
+   :--pitr-window                   1
+   :--base-snapshot-interval        1])
+
+;; ---------------------------------------------------------------------------
+;; Key-range routing
+;; ---------------------------------------------------------------------------
+
+(defn key-space
+  "The key space this test's workload stores its keys in, or nil for a workload
+  whose state is not key/value keys at all (locks, sequences).
+
+  A *key space* is a key's prefix up to — and excluding — its last `/`, which is
+  the same boundary Kommander hashes on. So `jepsen/register/4` lives in
+  `jepsen/register`. It is the unit key-range routing is opted into, so a
+  workload that cannot name one cannot be range-routed."
+  [test]
+  (:key-space test))
+
+(defn key-ranged?
+  "Is this test running its workload's key space under key-range routing?
+
+  Everything range-shaped — the registration step, the range nemesis, the range
+  checker's claims — keys off this and degrades to a no-op when it is false, so
+  a run without `--key-range` is unchanged by any of it."
+  [test]
+  (boolean (and (:key-range test) (key-space test))))
+
+(defn range-args
+  "Split/merge policy flags for one node's command line, rendered only for the
+  knobs a run actually set.
+
+  All four exist on the server with defaults that are right for production and
+  wrong for a 300 s chaos run: auto-split fires at 1000 sampled keys and the
+  sampler runs once a minute, so nothing splits by itself inside a run. The
+  nemesis does not need any of them — it forces splits through
+  `POST /v1/ranges/split`, which is deterministic — but a profile that wants to
+  exercise the *automatic* splitter has to be able to reach them.
+
+  `when-let` rather than `when`, because 0 is a meaningful value for two of
+  these (it disables the checker outright) and 0 is truthy in Clojure, so it
+  renders correctly. `--range-collection-interval` is shared with the key-value
+  collector, prepared-intent recovery and range-lock renewal — the server floors
+  it at the phase-two commit timeout and refuses to start below that, so
+  lowering it to make splits fire sooner is not free."
+  [test]
+  (concat
+    (when-let [n (:range-split-threshold test)]      [:--range-split-threshold n])
+    (when-let [n (:range-split-min-range-size test)] [:--range-split-min-range-size n])
+    (when-let [n (:range-merge-min-size test)]       [:--range-merge-min-size n])
+    (when-let [n (:range-collection-interval test)]  [:--range-collection-interval n])))
 
 (defn membership-faults?
   "Is the membership nemesis enabled for this test? Governs whether nodes are
@@ -102,6 +245,9 @@
     ;; still models a crash, not a polite departure.
     (when (membership-faults? test)
       [:--graceful-leave-on-shutdown])
+    (placement-args test node)
+    (range-args test)
+    (when (:force-compaction test) compaction-args)
     (when join?
       [:--join-existing]))))
 
@@ -337,6 +483,166 @@
     (wipe-data! test node)
     outcome))
 
+(defn placement
+  "The committed placement table as seen by `node`, or nil if it cannot answer.
+  A thin pass-through to the client so nemeses and checkers have one place to
+  reach for it."
+  [node]
+  (try+
+    (kc/cluster-placement node)
+    (catch Object _ nil)))
+
+(defn cluster-placement
+  "Every node's view of the placement table: {node → placement-or-nil}.
+
+  All of them are asked, not one: the committed map is cluster-wide, so
+  disagreement between two nodes at the same generation is a finding, and a
+  single-node read could never see it. Probes go out from the control node over
+  HTTP, so a node that is down contributes nil rather than an exception."
+  [test]
+  (into (sorted-map)
+        (map (fn [node] [node (placement node)]))
+        (:nodes test)))
+
+(defn ranges
+  "The range-descriptor map as seen by `node`, or nil if it cannot answer. A
+  thin pass-through to the client so the range nemesis and checker have one
+  place to reach for it."
+  [node]
+  (try+
+    (kc/range-map node)
+    (catch Object _ nil)))
+
+(defn cluster-ranges
+  "Every node's view of the range map: {node → range-map-or-nil}.
+
+  All of them are asked for the same reason `cluster-placement` asks all of
+  them: the descriptors are replicated, so two nodes describing one descriptor
+  differently is a finding a single-node read could never see. A node that is
+  down contributes nil rather than an exception."
+  [test]
+  (into (sorted-map)
+        (map (fn [node] [node (ranges node)]))
+        (:nodes test)))
+
+(defn key-space-view
+  "What one node's range map says about `space`: `{:routing-mode :descriptors}`,
+  or nil when the node has never heard of it."
+  [view space]
+  (get-in view [:key-spaces space]))
+
+(defn key-range-live?
+  "Does `node` route `space` by key range *and* have somewhere to route to?
+
+  Both halves are needed and neither implies the other. A registered space with
+  zero descriptors routes by key range with nothing underneath it, and every
+  write to it throws; a space with descriptors on a node that has not yet
+  reconciled its registry still hashes. Only the conjunction means the node can
+  serve the space."
+  [node space]
+  (let [v (key-space-view (ranges node) space)]
+    (boolean (and (= "KeyRange" (:routing-mode v))
+                  (seq (:descriptors v))))))
+
+(defn register-key-range!
+  "Registers `space` for key-range routing on **every** node, returning
+  {node → result}.
+
+  Every node, not one, and the reason is in the server's own contract: the seed
+  descriptor is a single replicated meta-partition write, but the routing-mode
+  flip is node-local. Seeding via one node does converge everywhere — each node
+  reconciles its registry against the descriptors it applies — but only after
+  the descriptor replicates. Registering everywhere collapses that window
+  instead of racing it, and each call is idempotent (`AlreadySeeded`).
+
+  Never throws: a node that refuses or cannot be reached is recorded, and
+  `await-key-range!` is what decides whether the cluster ended up usable."
+  [test space]
+  (into (sorted-map)
+        (map (fn [node]
+               [node (try+
+                       (kc/register-key-range! node space {})
+                       (catch Object o
+                         {:success false :outcome :unreachable :reason (str o)}))]))
+        (:nodes test)))
+
+(defn await-key-range!
+  "Blocks until every node routes `space` by key range with at least one
+  descriptor. Returns true, or false on timeout.
+
+  This is a precondition, not an observation, and it is worth waiting for: a
+  cluster where some nodes range-route a space and others hash it serves one key
+  from two partitions. Writes would then diverge silently, and the *workload's*
+  checker would report the result — a linearizability violation manufactured
+  entirely by the harness's own setup."
+  ([test space] (await-key-range! test space 60000))
+  ([test space timeout]
+   (try+
+     (util/await-fn
+       (fn []
+         (or (every? #(key-range-live? % space) (:nodes test))
+             (throw (RuntimeException. "key range not established on every node"))))
+       {:log-message (str "Waiting for key space " space " to be key-range routed")
+        :timeout     timeout
+        :interval    1000})
+     true
+     (catch Object _ false))))
+
+(defn establish-key-range!
+  "Puts `space` under key-range routing cluster-wide, or fails the DB setup.
+
+  Aborting is deliberate, and it is the opposite of how this suite treats a
+  mid-run failure — there, a node that does not come back is a result the
+  nemesis records. Setup is different: a run that could not establish key-range
+  routing cannot split a range, so its history would be labelled `-kr` while
+  testing hash routing. `:jepsen.db/setup-failed` is jepsen's own signal for
+  this and buys three whole teardown/setup cycles before the test gives up,
+  which is a plausible fix for a cluster that merely formed slowly."
+  [test space]
+  (let [results (register-key-range! test space)]
+    (info "key-range registration for" space ":"
+          (into (sorted-map) (map (fn [[n r]] [n (or (:outcome r) :no-answer)])) results))
+    (when-not (await-key-range! test space)
+      (throw+ {:type         :jepsen.db/setup-failed
+               :message      (str "key space " space
+                                  " is not key-range routed on every node")
+               :key-space    space
+               :registration results
+               :ranges       (cluster-ranges test)}))
+    (info "key space" space "is key-range routed cluster-wide")
+    true))
+
+(defn decommission!
+  "Removes `node` from the roster the way an operator would: commit the removal
+  through `POST /v1/cluster/leave`, *then* stop the process and wipe its state.
+
+  This is strictly better than the SIGTERM-and-wait leave in
+  `kahuna.nemesis.membership`, and the difference is diagnostic rather than
+  cosmetic. The endpoint answers with the consensus outcome, so a removal that
+  did not happen says `NoLeader` or `RefusedInsufficientVoters` instead of
+  looking exactly like one that did. That is what lets this run *combined* with
+  `partition` and `kill`: it does not need a fully-formed cluster as a
+  precondition, because it can tell afterwards whether it got one.
+
+  The process is stopped only when the removal actually committed. A node still
+  in the roster that has been killed is a `kill` fault wearing a leave's name,
+  and this nemesis would then be silently doing something other than what its
+  history says.
+
+  Returns {:left bool :outcome str ...} — the leave result, plus :stopped and
+  :wiped when the process was taken down. Runs in the caller's c/on-nodes
+  context, but talks to the node over HTTP."
+  [test node]
+  (let [result (try+
+                 (kc/cluster-leave! node {})
+                 (catch Object o
+                   {:left false :outcome :unreachable :reason (str o)}))]
+    (if (:left result)
+      (do (stop! test node)
+          (wipe-data! test node)
+          (assoc result :stopped true :wiped true))
+      (assoc result :stopped false :wiped false))))
+
 (defn join!
   "Adds `node` back: start it with --join-existing so it requests membership
   from its seeds as a Learner and is promoted once caught up. Runs in the
@@ -372,6 +678,19 @@
       (info node "tearing down Kahuna")
       (stop! test node)
       (c/su (c/exec :rm :-rf dir)))
+
+    ;; One-time, cluster-wide setup, run on the first node after *every* node's
+    ;; setup! has returned. Key-range registration has to happen here and not in
+    ;; setup!: setup! runs concurrently on all nodes, and seeding a whole-space
+    ;; descriptor from six nodes at once against a cluster that has not finished
+    ;; electing a meta-partition leader is a race with nothing to gain.
+    db/Primary
+    (primaries [this test]
+      [(first (:nodes test))])
+
+    (setup-primary! [this test node]
+      (when (key-ranged? test)
+        (establish-key-range! test (key-space test))))
 
     db/LogFiles
     (log-files [this test node]
