@@ -111,12 +111,30 @@
       ;; Load reports are enabled automatically whenever a factor is set; asking
       ;; for them explicitly costs nothing and makes the intent legible in `ps`.
       [:--raft-enable-load-reports]
+      ;; How often the P0 leader runs a placement pass. Left at the server
+      ;; default unless asked: the pass is what drives in-flight transitions and
+      ;; plans moves, and it used to run only when the leader balancer was on —
+      ;; which this harness never enables, so no pass ever ran and no replica
+      ;; ever moved. That is now decoupled; the flag is here so a profile can
+      ;; bound convergence speed rather than to switch anything on.
+      (when-let [n (:placement-pass-interval test)]
+        [:--raft-placement-pass-interval n])
       (when-let [n (:max-replica-moves-per-pass test)]
         [:--raft-max-replica-moves-per-pass n])
       (when-let [n (:max-concurrent-replica-transfers test)]
         [:--raft-max-concurrent-replica-transfers n])
+      ;; Budgeted apart from transfers on purpose: restoring durability after a
+      ;; node loss must not queue behind cosmetic skew-spreading moves.
+      (when-let [n (:max-concurrent-replica-repairs test)]
+        [:--raft-max-concurrent-replica-repairs n])
       (when-let [n (:replica-count-deadband test)]
         [:--raft-replica-count-deadband n])
+      ;; How long a graceful leave waits for this node's replicas to be
+      ;; evacuated before giving up and restoring it to a voter. Worth bounding
+      ;; in a chaos profile: the nemesis blocks on the call, so at the server's
+      ;; 120 s default one decommission can eat a quarter of a 900 s run.
+      (when-let [n (:decommission-drain-timeout test)]
+        [:--raft-decommission-drain-timeout n])
       (when-let [z (zone test node)]
         [:--raft-zone z]))))
 
@@ -693,11 +711,20 @@
   The process is stopped only when the removal actually committed. A node still
   in the roster that has been killed is a `kill` fault wearing a leave's name,
   and this nemesis would then be silently doing something other than what its
-  history says.
+  history says. `DrainTimedOut` is exactly that case and is why the rule is
+  `:left`, not 'the call returned': on a drain timeout the node is *restored to
+  a voter* and keeps serving, so stopping it would be a kill.
 
-  Returns {:left bool :outcome str ...} — the leave result, plus :stopped and
-  :wiped when the process was taken down. Runs in the caller's c/on-nodes
-  context, but talks to the node over HTTP."
+  The call now blocks for as long as the drain takes — a graceful leave
+  evacuates this node's replicas onto survivors before committing — so it is the
+  slowest thing this nemesis does. `--decommission-drain-timeout` bounds it.
+
+  Returns {:left bool :drained bool :outcome str ...} — the leave result, plus
+  :stopped and :wiped when the process was taken down. `:drained` is worth
+  reading alongside `:left`: it says durability was preserved by evacuating the
+  replicas rather than left to post-hoc repair, and it is legitimately false at
+  full replication where no range names a node individually. Runs in the
+  caller's c/on-nodes context, but talks to the node over HTTP."
   [test node]
   (let [result (try+
                  (kc/cluster-leave! node {})

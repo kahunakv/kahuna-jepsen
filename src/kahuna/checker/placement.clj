@@ -14,6 +14,12 @@
   nightlies whose reads returned nothing and were certified valid), so the
   verdict here is `:unknown` unless the run can show its work.
 
+  The gate applies only to runs that could actually have moved something — see
+  `replica-moving-faults`. At a replication factor with nothing but `partition`,
+  no replica was ever going to move, and failing that run would be punishing it
+  for not doing something it was never asked to do. Safety is still checked;
+  only the vacuity gate is scoped, and a run with it off says so in `:gate`.
+
   What counts as showing its work is `--require-placement-evidence`, and each
   kind is read from a different place:
 
@@ -393,6 +399,38 @@
   order they are reported."
   [:move :seeding :purge :split])
 
+(def replica-moving-faults
+  "Faults that can change the committed placement map, and so can be asked to
+  demonstrate that they did.
+
+  `:placement` is the only one whose *purpose* is to move replicas — per-range
+  factor overrides, decommission and rejoin. `:kill` and `:membership` move them
+  as a side effect: a dead or departed node's ranges have to be repaired onto
+  the survivors.
+
+  `:partition` is absent because a network fault does not change the committed
+  map — it changes who can see it. `:pause` is absent too, and less certainly:
+  a SIGSTOPed node stops heartbeating and may well look failed to the planner,
+  but nothing in this suite has shown that it triggers repair, and a gate is
+  worth only what its evidence is. Widen this the day a paused node is observed
+  causing a move."
+  #{:placement :kill :membership})
+
+(defn- gated?
+  "Should this run be required to demonstrate placement activity?
+
+  Only when it ran a fault that could have produced some. A run at a replication
+  factor with nothing but `partition` is a legitimate configuration — it tests
+  that placed routing survives a network fault — and *nothing moving* is its
+  expected outcome, not a vacuous result. Demanding evidence there fails a run
+  for not doing something it was never asked to do, which is how a real gate
+  gets switched off wholesale.
+
+  The safety properties are checked either way. This governs the vacuity gate
+  alone."
+  [test]
+  (boolean (some replica-moving-faults (:faults test))))
+
 (def default-required-evidence
   "What a placement run must show before its pass means anything.
 
@@ -472,8 +510,11 @@
               move     (movement ss)
               roles    (roles-observed ss)
               ev       (evidence ss logs)
-              required (set (:require-placement-evidence test
-                                                         default-required-evidence))
+              gate-on? (gated? test)
+              required (if gate-on?
+                         (set (:require-placement-evidence test
+                                                           default-required-evidence))
+                         #{})
               {:keys [shown missing unmeasured]} (gate required ev)
               base     {:replication-factor (kdb/replication-factor test)
                         :samples            (count ss)
@@ -486,7 +527,14 @@
                         :hosting-lag        (hosting-lag ss)
                         :transitions        (:transitions move)}
               base     (cond-> base
-                         logs (assoc :log-markers (:totals logs)))]
+                         logs (assoc :log-markers (:totals logs))
+                         ;; Said out loud rather than inferred from an empty
+                         ;; :evidence-required. A reader who sees no gate must be
+                         ;; able to tell "switched off deliberately, and why"
+                         ;; from "switched off by accident".
+                         (not gate-on?)
+                         (assoc :gate :off
+                                :gate-reason :no-replica-moving-fault))]
           (cond
             (seq vs)
             (assoc base :valid? false

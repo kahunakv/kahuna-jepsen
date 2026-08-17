@@ -41,95 +41,124 @@ Not started:
 - [x] replication-factor profile — six nodes, per-partition replica placement,
       a nemesis that moves replicas (`src/kahuna/nemesis/placement.clj`) and a
       checker that refuses to call a run that moved nothing a pass
-      (`src/kahuna/checker/placement.clj`). **Built, not yet run** — see below.
+      (`src/kahuna/checker/placement.clj`). **Run 2026-08-17: every workload
+      passed and the planner moved nothing** — see below.
 - [x] key-range profile — the workload's key space routed by key order, a
       nemesis that forces splits and merge passes under load
       (`src/kahuna/nemesis/range.clj`) and a checker that fails on a gap or an
       overlap and refuses to call a run that split nothing a pass
-      (`src/kahuna/checker/range.clj`). **Built, not yet run** — see below.
+      (`src/kahuna/checker/range.clj`). **Green 2026-08-17** at RF 0 — six
+      splits, two merges, no id reused — see below.
 
-## Open: the key-range profile has never been run
+## Closed: the key-range profile runs, and splits work under chaos
 
-Scenario 8 of the placement spec — split/merge under a replication factor with
-concurrent writers — was recorded here as unreachable, and it was: the split
-thresholds had no server flag, the force-split primitive was `internal`, the
-range map had no read surface, and an ordinary Jepsen key was hash-routed with
-nothing to split. All four are now exposed on `Kahuna.Server`, and `--key-range`
-is the harness half. **No run has been executed against a range-routed
-cluster**, so nothing here is a result yet.
+Scenario 8 of the placement spec — split/merge under concurrent writers — was
+recorded here as unreachable, and it was: the split thresholds had no server
+flag, the force-split primitive was `internal`, the range map had no read
+surface, and an ordinary Jepsen key was hash-routed with nothing to split. All
+four are now exposed on `Kahuna.Server`, and `--key-range` is the harness half.
 
-Two failures found while building against the new surface are already fixed
-server-side, and the harness checks the invariant the fix established rather than
-merely hoping for it:
+**First green run: `register / partition,kill,range` at RF 0, run 31992957463.**
 
-* **Split after a merge.** The next partition id was derived from the range map,
-  which forgets retired partitions, while Kommander keeps them as `Removed` and
-  refuses to recreate one. Auto-split was affected identically, so any key space
-  that had ever been split and merged back failed its next automatic split
-  silently. The split/merge cycle this nemesis runs — two splits per merge pass —
-  walks straight into it, which is why the merge op is in the generator at all.
-* **Split rollback with no merge required.** A split that failed after the
-  partition was created retired the id on cleanup, and the next
-  `ComputeNextPartitionId` returned the same, now-tombstoned, id — wedging the
-  auto-splitter for *every* key space after a single transfer failure.
-* A third, same root cause: with several initial partitions the arithmetic could
-  pick an id inside the hash pool, and `CreatePartitionAsync` answers idempotent
-  success on a live partition — so ranged data joined hash-routed data on one
-  partition with nothing logged. This is the one a run would never have noticed.
+```clojure
+:range {:splits {:destinations [4 5 6 7 8 9], :reused [], :succeeded 6,
+                 :creation-failed 0, :indeterminate 0, :refused 0}
+        :merges {:merges 2}
+        :max-descriptors 5, :valid? true}
+```
 
-The fix allocates one past every id Kommander has ever used, so **a destination
-id is never handed out twice**. The range checker fails a run in which two
-acknowledged splits name the same `newPartitionId`, and reports
-`PartitionCreationFailed` apart from other refusals — that status is what a
-recycled id looks like to a caller. Both read the server's own answers rather
-than the sampled maps: nodes lag, so an id can leave every view and reappear
-from a node that had not caught up, and on a run that churns the roster that
-would fire constantly.
+Six splits and two merges under `partition,kill`, coverage intact in all 167
+sampled range maps, and the workload linearizable throughout. Splits 7, 8 and 9
+landed *after* the merges — the split → merge → split sequence that used to
+wedge the splitter for the rest of a run.
 
-**Expect the first runs to be about the harness.** Every workload here found a
-harness or wire-contract bug before it found a server bug. The specific thing to
-rule out first on a red key-range run is a `:workload` failure with a clean
-`:range` — a cluster where some nodes range-route the space and others hash it
-serves one key from two partitions, and the linearizability checker is what
-would announce that. The DB setup is supposed to make it impossible (registration
-is a precondition and aborts the run rather than proceeding), but "supposed to"
-is what this file is full of.
+The RF 3 runs split too: 4 successes on `partition,kill,placement,range`, 3 on
+`append / partition,placement,range`, `:reused []` in both. Both jobs are still
+red, but on `:placement`, not `:range` — see the rebalancer finding below.
 
-What a first run should be able to demonstrate, and what the checker reports on
-every key-range run, is `:evidence {:split …}` — either a `Succeeded` cutover
-acknowledged by the server or a sampled layout with more than one descriptor.
-A run without one tested less than its name claims. `--require-range-evidence
-split,merge` additionally demands a merge pass that folded something, which is
-the pairing that exercises the two bugs above.
+### The partition-id fix is confirmed, not merely trusted
 
-## Open: the placement profile has never been run
+Three failures shared one root cause: the next partition id was derived from the
+range map, which forgets retired partitions, while Kommander keeps them as
+`Removed` and refuses to recreate one.
 
-The harness for per-partition replica placement is in the tree and its unit
-tests pass, but **no run has been executed against a placed cluster**, so
-nothing here is a result yet. Two things should happen before one is read as
-one.
+* **Split after a merge** — any key space split and merged back failed its next
+  split, auto-split included, silently.
+* **Split rollback with no merge required** — a split that failed after creating
+  its partition retired that id on cleanup, and the next allocation returned the
+  same, now-tombstoned id, wedging the auto-splitter for *every* key space after
+  a single transfer failure.
+* **A live id inside the hash pool** — with several initial partitions the
+  arithmetic could pick an id already serving hash-routed data, and
+  `CreatePartitionAsync` answers idempotent success. Ranged data silently joined
+  hash-routed data on one partition. This is the one no run would have noticed.
 
-**Re-establish the RF-0 baseline first.** Several fixes are still awaiting
-Jepsen confirmation on full replication — the follower term-adoption fix
-(open above), and the snapshot workloads whose only observing runs postdate the
-wire-dialect fix in `27b6363`. Placement adds forwarding, seeding and purging
-to every operation's path; attributing a failure to it while the legacy profile
-is unconfirmed would be exactly the mistake this file has already recorded
-twice.
+The fix allocates one past every id Kommander has ever used. The checker fails a
+run in which two acknowledged splits name the same `newPartitionId`, and reports
+`PartitionCreationFailed` — the caller-side signature of a recycled id — apart
+from other refusals. Both read the server's own answers rather than the sampled
+maps: nodes lag, so an id can leave every view and reappear from a node that had
+not caught up, and on a run that churns the roster that check would fire
+constantly. Across three key-range jobs, `:reused []` and `:creation-failed 0`.
 
-**Expect the first runs to be about the harness, not about Kahuna.** Every
-workload here found a harness bug or a wire-contract bug before it found a
-server bug, and there is no reason to think a profile this new is different.
-The first thing to check on a red placement run is which of `:workload`,
-`:placement` and `:stats` is false — a `:placement {:valid? :unknown}` is the
-checker saying the run proved nothing, not a violation.
+### Two things to watch, neither a failure
 
-The things a first run should be able to demonstrate, and which the checker
-reports on every placed run, are `:evidence {:move … :seeding … :purge …}` —
-at least one committed replica-set change, at least one
-`Imported whole-partition state` (the snapshot seeding path, reachable only with
-`--force-compaction`; see DESIGN.md) and at least one `Stopped hosting` (the
-un-host purge). A run missing any of them tested less than its name claims.
+**Most range ops skip.** `:skipped {:no-split-key 11–15}` against 6–8 attempts:
+once ranges narrow, a 64-key page from one of them often holds fewer than two
+distinct keys, and the nemesis correctly declines rather than issuing a split
+the server would refuse. Picking the widest descriptor instead of a random one
+would raise the rate.
+
+**Splits fail mid-transfer under network faults.** `append` saw 3 `TransferFailed`
+and 2 `Indeterminate` out of 8 attempts. Plausible under `partition`, and the
+harness classified them apart from refusals rather than manufacturing findings —
+which is what that distinction exists for. Worth watching if the ratio grows.
+
+## Open: the placement rebalancer never moves a replica
+
+**Confirmed across two independent runs (31991338560, 31992957463), five jobs
+each, on six nodes at RF 3 and RF 1.** Every placed run reports:
+
+```clojure
+:placement {:movement {:replicas-gained 0, :replicas-lost 0, :partitions-moved 0}
+            :transitional {:learners 0, :removings 0}
+            :transitions []
+            :log-markers {:unhosted 0, :imported 0, :exported 0}
+            :valid? :unknown, :cause :vacuous, :missing [:move :seeding :purge]}
+:workload {:linear {:valid? true}}
+```
+
+In the 900 s scale-down job, with the rebalancer enabled — the server's own
+`/v1/cluster/placement` reports `:rebalancer true` on every node in all 296
+samples, and the startup banner appears on all 11 boots:
+
+* a per-range override **committed** — `:set-rf {:partition 5, :from 3, :to 1,
+  :committed true, :accepted-by "n4"}` — and the planner never trimmed the range;
+* three of six nodes were gracefully decommissioned (`:outcome "Committed"`,
+  HTTP 200, stopped and wiped) and rejoined, and their ranges were never
+  re-replicated. The map went on listing departed nodes as voters;
+* `:placement-before` and `:placement-after` are byte-identical on every nemesis
+  op: `[generation 1, 3 voters, 0 transitional]` for all 8 partitions.
+
+Two independent sources agree — the sampled placement tables and the server's own
+logs (`Stopped hosting` 0, `Imported whole-partition state` 0). `Started hosting`
+is 11, which is one per boot and nothing to do with movement.
+
+The verdict is `:unknown`, not `false`, and that is the correct call: the checker
+can say nothing was exercised, but it cannot distinguish "the planner is broken"
+from "the planner decided nothing needed moving". Given a committed override to
+RF 1 and half the roster leaving, the latter is hard to defend — but that
+judgement belongs in the server repo, where it is filed.
+
+**This is what the vacuity gate was built for.** Every workload check in all five
+jobs passed. Without the gate, all five would have gone green and "placement
+validated" would have been the conclusion — the third time this repository would
+have shipped runs that proved nothing while reporting health.
+
+Still open from the original prerequisites: **the RF-0 baseline is green but the
+follower term-adoption fix remains unconfirmed** (open above). Placement adds
+forwarding, seeding and purging to every operation's path; attributing a failure
+to it while that is outstanding is the mistake this file already records twice.
 
 ## Closed: "mutual exclusion violated" was a bug in *this* checker
 

@@ -312,8 +312,14 @@ jobs:
           # micro-ops span a range being split has to see one map or the other,
           # never half of each -- the prepare is routed per key, so a cutover
           # between two prepares is the window. Elle is what would notice.
+          #
+          # `placement` is in the fault list so the destination partition's
+          # replicas move while transactions cross it, which is the pairing
+          # scenario 8 actually names. Isolated range coverage -- splits with no
+          # replica churn to muddy them -- is carried by the RF 0 job above, so
+          # nothing is lost by making this one stronger.
           - workload: append
-            faults: partition,range
+            faults: partition,placement,range
             nodes: n1,n2,n3,n4,n5,n6
             concurrency: 6
             ops_per_key: 60
@@ -423,6 +429,13 @@ jobs:
         # run exactly the cluster they ran before. The same holds for
         # --range-interval, which is inert unless the `range` fault is on.
         #
+        # --decommission-drain-timeout is rendered on every job and is inert
+        # without a replication factor: at RF 0 no range names a node
+        # individually, so a graceful leave has nothing to evacuate. It is
+        # bounded well below the server's 120 s default because the placement
+        # nemesis *blocks* on the leave call, and one decommission at the
+        # default would eat a quarter of a 900 s run.
+        #
         # --force-compaction and --key-range are the two exceptions: both are
         # switches, so they are present or absent rather than carrying a value.
         # --key-range is the one flag here that changes what the cluster *does*
@@ -447,6 +460,7 @@ jobs:
             --replication-factor ${{ matrix.replication_factor || 0 }} \
             --placement-interval ${{ matrix.placement_interval || 30 }} \
             --placement-nodes-out ${{ matrix.placement_nodes_out || 1 }} \
+            --decommission-drain-timeout ${{ matrix.decommission_drain_timeout || 60000 }} \
             --range-interval ${{ matrix.range_interval || 20 }} \
             ${{ matrix.force_compaction && '--force-compaction' || '' }} \
             ${{ matrix.key_range && '--key-range' || '' }} \

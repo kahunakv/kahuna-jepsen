@@ -317,17 +317,53 @@
     :parse-fn read-string
     :validate [(complement neg?) "must be non-negative"]]
 
+   [nil "--placement-pass-interval MS" "How often the P0 leader runs a placement
+                                       pass — driving in-flight transitions and
+                                       planning moves. A relocation costs about
+                                       three passes plus a trim, so this bounds
+                                       convergence speed. Server default 5000;
+                                       0 disables the timer and leaves only
+                                       commit-driven passes."
+    :parse-fn read-string
+    :validate [(complement neg?) "must be non-negative"]]
+
    [nil "--max-replica-moves-per-pass N" "New replica moves the placement
                                          controller may start per pass — the
-                                         blast radius of a bad plan."
+                                         blast radius of a bad plan. Keep it at
+                                         least repairs + transfers, or it binds
+                                         first and starves repair behind
+                                         cosmetic balancing."
     :parse-fn read-string
     :validate [pos? "must be positive"]]
 
    [nil "--max-concurrent-replica-transfers N" "Ranges allowed an in-flight
-                                                Learner/Removing replica at
-                                                once. Raise it to converge
-                                                faster at the cost of more
-                                                concurrent backfill."
+                                                Learner/Removing replica from a
+                                                *balance* move at once. Raise it
+                                                to converge faster at the cost of
+                                                more concurrent backfill."
+    :parse-fn read-string
+    :validate [pos? "must be positive"]]
+
+   [nil "--max-concurrent-replica-repairs N" "In-flight *repair* moves allowed at
+                                              once — re-replicating
+                                              under-replicated ranges and
+                                              shedding replicas stranded on
+                                              evicted nodes. Budgeted apart from
+                                              transfers so restoring durability
+                                              after a node loss is not
+                                              serialized behind skew-spreading."
+    :parse-fn read-string
+    :validate [pos? "must be positive"]]
+
+   [nil "--decommission-drain-timeout MS" "How long a graceful leave waits for
+                                          this node's replicas to be evacuated
+                                          onto survivors before giving up. On
+                                          expiry the node is restored to a voter
+                                          and the leave reports DrainTimedOut;
+                                          replicas already moved stay moved, so a
+                                          retry resumes the drain. Server default
+                                          120000, which is a quarter of a 900 s
+                                          run — the nemesis blocks on the call."
     :parse-fn read-string
     :validate [pos? "must be positive"]]
 
@@ -393,7 +429,12 @@
                                              triggered none of the machinery
                                              under test is a vacuous pass, so
                                              the checker returns :unknown rather
-                                             than success. 'split' is not a
+                                             than success. Ignored unless the
+                                             run carries a fault that could move
+                                             a replica (placement, kill,
+                                             membership) — a partition-only run
+                                             at a replication factor is expected
+                                             to move nothing. 'split' is not a
                                              default: it needs --key-range, and
                                              is gated by --require-range-evidence
                                              instead, which measures it from the

@@ -22,9 +22,15 @@
 (def nodes ["n1" "n2" "n3" "n4"])
 
 (def base-test
-  "A four-node test at RF 3, requiring only sample-derived evidence."
+  "A four-node test at RF 3, requiring only sample-derived evidence.
+
+  `:faults` is load-bearing, not decoration: the vacuity gate applies only to
+  runs carrying a fault that could have moved a replica, so a test map without
+  one would quietly switch the gate off and every refusal test below would pass
+  for the wrong reason."
   {:nodes nodes
    :replication-factor 3
+   :faults #{:placement}
    :require-placement-evidence #{:move}})
 
 (defn ep [n] (str n ":8082"))
@@ -229,3 +235,51 @@
   (let [r (check* base-test [(sample 0 steady) (sample 1000 moving) (sample 2000 moved)])]
     (is (= 1 (get-in r [:transitional :learners])))
     (is (= 0 (get-in r [:transitional :removings])))))
+
+;; ---------------------------------------------------------------------------
+;; The gate is scoped to runs that could have moved something
+;; ---------------------------------------------------------------------------
+
+(deftest a-partition-only-run-is-not-asked-to-prove-a-move
+  ;; A replication factor with nothing but `partition` is a legitimate profile:
+  ;; it tests that placed routing survives a network fault. No replica was ever
+  ;; going to move, so "nothing moved" is the expected outcome and not a vacuous
+  ;; result. Failing it would punish the run for not doing something it was
+  ;; never asked to do — and a gate that fires on correct configurations is one
+  ;; that gets switched off wholesale.
+  (let [r (check* (assoc base-test :faults #{:partition})
+                  [(sample 0 steady) (sample 1000 steady)])]
+    (is (true? (:valid? r)))
+    (is (= :off (:gate r)))
+    (is (= :no-replica-moving-fault (:gate-reason r)))
+    ;; Still measured and still reported — switching the gate off must not
+    ;; switch off the observation, or a reader loses the ability to notice that
+    ;; a run they expected to move things did not.
+    (is (= 0 (get-in r [:evidence :move :count])))))
+
+(deftest kill-alone-is-still-asked-to-prove-a-move
+  ;; The accepting twin, and the reason the set is not just #{:placement}: a
+  ;; dead node's ranges have to be repaired onto the survivors, so a kill run
+  ;; that moved nothing is exactly as vacuous as a placement run that did.
+  (let [r (check* (assoc base-test :faults #{:kill})
+                  [(sample 0 steady) (sample 1000 steady)])]
+    (is (= :unknown (:valid? r)))
+    (is (= :vacuous (:cause r)))
+    (is (nil? (:gate r)))))
+
+(deftest membership-alone-is-still-gated
+  (let [r (check* (assoc base-test :faults #{:membership})
+                  [(sample 0 steady) (sample 1000 steady)])]
+    (is (= :unknown (:valid? r)))
+    (is (= :vacuous (:cause r)))))
+
+(deftest an-ungated-run-still-fails-on-a-safety-violation
+  ;; The scoping governs the vacuity gate and nothing else. A partition-only run
+  ;; that shows two movers on one range is still broken, and a checker that
+  ;; stopped looking because it had stopped demanding would be worse than one
+  ;; that never gated at all.
+  (let [two {1 (view 2 [["n1" :voter] ["n2" :voter] ["n3" :learner] ["n4" :learner]])}
+        r   (check* (assoc base-test :faults #{:partition})
+                    [(sample 0 steady) (sample 1000 two)])]
+    (is (false? (:valid? r)))
+    (is (contains? (set (map :type (:violations r))) :multiple-movers))))

@@ -211,6 +211,23 @@ scenarios worth hunting. The process is stopped only when the removal actually
 committed; killing a node that is still in the roster would be a `kill` fault
 wearing a leave's name.
 
+That rule stopped being a nicety when leaves learned to **drain**. A graceful
+leave now evacuates the node's replicas onto survivors before committing the
+removal, so departure preserves durability instead of leaving it to post-hoc
+repair — and it adds `DrainTimedOut`, which means the evacuation did not finish
+and the node has been *restored to a voter and is still serving*. A nemesis that
+keyed off "the call returned" rather than off `:left` would stop that node, and
+the history would record a kill as a leave. Replicas already moved stay moved,
+so a later attempt resumes the drain rather than restarting it.
+
+The drain also makes the leave the slowest thing the nemesis does: the call
+blocks for its duration, and the server's own request deadline is the drain
+timeout plus 30 s. Two consequences the harness has to respect. The client
+timeout must sit *above* that deadline — cutting it short reports `:unreachable`
+for a departure that commits anyway, and then declines to stop a node that has
+actually left. And the drain timeout wants bounding well below its 120 s default
+in a chaos profile, or a single decommission eats a quarter of a 900 s run.
+
 ### The checker's job is mostly to refuse
 
 Everything else in this suite can fail. `kahuna.checker.placement` exists first
@@ -229,6 +246,30 @@ endpoint. The tempting fifth, an upper bound on voters, is deliberately absent:
 lowering a range's factor legitimately leaves it over-replicated until the
 planner trims it, which is exactly what the nemesis's `:set-rf` asks for, and a
 check that fires on the nemesis's own intended effect is a bug in the checker.
+
+### The vacuity gate is scoped to runs that could have moved something
+
+The gate demands evidence only when the run carried a fault that can change the
+committed map: `placement`, `kill` or `membership`. `partition` cannot — it
+changes who can *see* the map, not what it says — and a replication-factor run
+with nothing but `partition` is a legitimate profile whose expected outcome is
+that nothing moves. Failing it would punish a run for not doing something it was
+never asked to do, and a gate that fires on correct configurations is one that
+gets switched off wholesale.
+
+`pause` is excluded too, less confidently. A SIGSTOPed node stops heartbeating
+and may well look failed to the planner, but nothing here has shown that it
+triggers repair, and a gate is worth only what its evidence is. Widen the set the
+day a paused node is observed causing a move.
+
+Safety is checked either way — violations and cross-node disagreements do not
+depend on the gate. Only the vacuity verdict is scoped, and a run with the gate
+off reports `:gate :off` with a reason rather than leaving a reader to infer it
+from an empty `:evidence-required`.
+
+This was found the hard way: an `append` job at RF 3 with `partition,range` and
+no placement fault was structurally incapable of satisfying the gate, so it
+failed for a reason that had nothing to do with what it was testing.
 
 ### What this profile cannot reach today
 

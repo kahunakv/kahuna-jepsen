@@ -631,19 +631,52 @@
      :reason      (:reason body)
      :http-status status}))
 
+(def leave-timeout-ms
+  "Client timeout for `POST /v1/cluster/leave`.
+
+  Must sit above the *server's* deadline, which is
+  `--raft-decommission-drain-timeout` plus a 30 s margin — 150 s at the server's
+  defaults. A graceful leave now evacuates this node's replicas onto survivors
+  before committing the removal, and that drain is the slow part.
+
+  Cutting it short from the client is worse than waiting: the socket times out
+  while the drain runs on, so the harness records `:unreachable` for a departure
+  that then commits anyway, declines to stop a node that has actually left, and
+  reports a no-op fault as an unreachable one. The server's own comment makes
+  exactly this point about its internal guard, and a client that ignored it
+  would reintroduce the problem one layer out."
+  180000)
+
 (defn cluster-leave!
   "Decommissions `node`: commits its removal from the roster now, rather than
   stopping the process and making the cluster infer the departure from silence.
 
   The node keeps serving its port afterwards so this answer can be read;
-  stopping it is the caller's next step. `:outcome` is the consensus outcome
-  name (`Committed`, `NotAMember`, `RefusedInsufficientVoters`, `NotInitialized`,
-  `NoLeader`, `Timeout`), so — unlike a SIGTERM-and-hope leave — a nemesis can
-  record *why* a removal did not happen instead of inferring it from a roster
-  count."
+  stopping it is the caller's next step, and `:left` — not `:drained` — is what
+  says that is safe.
+
+  `:outcome` is the consensus outcome name, and the set is worth knowing because
+  two of them are new and neither means failure:
+
+  * `Committed` / `NotAMember` — the node is out of the roster (200).
+  * `RefusedDrainInProgress` — only one decommission may drain at a time and
+    another is running (503). Nothing changed; it clears on its own.
+  * `DrainTimedOut` — the replicas were not fully evacuated in time, so the node
+    is **restored to a voter** and keeps serving (504). Replicas already moved
+    stay moved, so a retry resumes the drain rather than restarting it.
+  * `RefusedInsufficientVoters` — permanent; removing the last voter would
+    strand the cluster (409).
+  * `NotInitialized` / `NoLeader` / `Timeout` — could not attempt it.
+
+  `:drained` is a separate question from `:left`: it says the committed
+  partition map stopped naming this node *before* the removal, so per-partition
+  durability was preserved by evacuation rather than left to post-hoc repair. It
+  is legitimately false at full replication, where no range names a node
+  individually."
   [node {:keys [timeout]}]
-  (let [r (post! node "/v1/cluster/leave" {} {:timeout (or timeout 30000)})]
+  (let [r (post! node "/v1/cluster/leave" {} {:timeout (or timeout leave-timeout-ms)})]
     {:left               (true? (:left r))
+     :drained            (true? (:drained r))
      :outcome            (:outcome r)
      :membership-version (:membershipVersion r)
      :retryable          (true? (:retryable r))

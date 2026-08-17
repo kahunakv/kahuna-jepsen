@@ -39,15 +39,26 @@
 
   `POST /v1/cluster/leave` commits the removal synchronously and answers with
   the consensus outcome (`Committed`, `NoLeader`, `RefusedInsufficientVoters`,
-  `Timeout`, …). A nemesis that can read *why* a removal did not happen does not
-  need a healthy-cluster precondition, so this one runs alongside `partition`
-  and `kill` — which is the entire point, since 'leadership moves between the
-  add and the promote' and 'a node dies mid-purge' are the scenarios worth
-  hunting.
+  `RefusedDrainInProgress`, `DrainTimedOut`, `Timeout`, …). A nemesis that can
+  read *why* a removal did not happen does not need a healthy-cluster
+  precondition, so this one runs alongside `partition` and `kill` — which is the
+  entire point, since 'leadership moves between the add and the promote' and 'a
+  node dies mid-purge' are the scenarios worth hunting.
+
+  A graceful leave now **drains** first: the node's replicas are evacuated onto
+  survivors before its removal commits, so the departure preserves durability
+  rather than leaving it to post-hoc repair. That makes this the slowest
+  operation here — the call blocks for the whole drain — and it adds an outcome
+  that must not be mistaken for a departure. `DrainTimedOut` means the evacuation
+  did not finish, so the node is *restored to a voter* and keeps serving;
+  replicas already moved stay moved, so a later attempt resumes rather than
+  restarts.
 
   The process is stopped only when the removal actually committed. Killing a
   node that is still in the roster is a `kill` fault wearing a leave's name, and
-  a history that recorded it as a leave would be lying.
+  a history that recorded it as a leave would be lying — which is precisely what
+  a `DrainTimedOut` would become if this keyed off the call returning instead of
+  off `:left`.
 
   ## Sampling, and why it is separate
 
