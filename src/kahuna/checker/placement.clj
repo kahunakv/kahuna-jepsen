@@ -340,12 +340,32 @@
    :imported "Imported whole-partition state of partition"
    :exported "Exported whole-partition state of partition"
    ;; Diagnostic only — never evidence. These exist because `:seeding 0` has
-   ;; three very different causes and the harness spent two runs guessing
-   ;; between them: compaction never ran (the threshold is per partition and the
-   ;; workload never reached it), compaction ran but freed nothing, or
-   ;; compaction was refused because the application-durability floor had not
-   ;; advanced. The first is a harness calibration bug, the third is a server
-   ;; condition, and a run that reports only `imported 0` cannot tell them apart.
+   ;; several very different causes and the harness spent two runs guessing
+   ;; between them.
+   ;;
+   ;; **They are weaker than they look, and the gap is worth knowing before
+   ;; reading them.** `RunCompactionPassAsync` returns *silently* twice before
+   ;; it logs anything: once when the WAL reports no checkpoint
+   ;; (`lastCheckpoint <= 0`) and again when the composed retain floor comes out
+   ;; at or below zero. Both returns are above `LogInfoCompactionStarted`. So
+   ;; `:compaction-started 0` does **not** mean "the threshold was never
+   ;; reached" — it is equally consistent with a pass firing on every single
+   ;; commit and returning immediately because nothing has checkpointed yet.
+   ;;
+   ;; What these can still tell you, and it is worth having:
+   ;;
+   ;; * `:compaction-started` > 0 — passes are getting past both early returns,
+   ;;   so the threshold is being reached and a floor exists.
+   ;; * `:compaction-blocked` > 0 — the application-durability floor is holding
+   ;;   the WAL, which is a server condition rather than a calibration one.
+   ;; * all three 0 — *unresolved*. Either the counter never fires or every pass
+   ;;   returns silently, and no log line distinguishes them. Answering it needs
+   ;;   the server to log its early returns; that is filed upstream.
+   ;;
+   ;; Verified that the markers themselves are sound: Kommander's log lines do
+   ;; reach `kahuna.log` (its `[endpoint/partition]` prefix appears throughout),
+   ;; and the flags do reach the server, so a zero here is a real absence of
+   ;; output rather than a capture problem.
    :compaction-started "Compaction process started"
    :compaction-done    "Compaction finished"
    :compaction-blocked "Compaction blocked by application-durability floor"

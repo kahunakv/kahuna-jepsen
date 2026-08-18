@@ -240,33 +240,47 @@ descriptor router instead of the hash locator. `append / partition`, `append / p
 n = 1, and `partition` and `placement` are both still in play. The spec names the control run that
 would settle it: `append / range` at RF 0, no other faults.
 
-## Open: snapshot seeding still does not fire for most workloads
+## Open: snapshot seeding never fires, and the WAL never compacts
 
-Lowering `--raft-compact-every-operations` from 200 to 20 (above) helped but did not close it.
-Run `32051818625`: `register / partition,kill,placement` went from red to green and the append
-key-range job reached `imported 8`, but four jobs still report `:missing [:seeding]` at
-`imported 0`.
+Lowering `--raft-compact-every-operations` from 200 to 20 was not the answer, and the markers added
+to diagnose it turned out to be weaker than intended. Both are worth recording precisely, because
+this took three runs.
 
-Rather than guess a third threshold, the placement checker now counts Kommander's own compaction
-lines, which separate the three causes that `imported 0` currently conflates:
+**What is established.** Across runs `32051818625` and `32081808304`, every placed job reports
+`imported 0` — no replica is ever seeded by whole-partition snapshot, so `PartitionStateTransfer` is
+never entered and each Learner catches up by log backfill instead. Pulling a run's store artifact
+and reading the node logs directly:
 
-| marker | means |
-|---|---|
-| `Compaction process started` | the threshold was reached at all |
-| `Compaction finished Removed=…` | a pass ran to completion |
-| `Compaction blocked by application-durability floor` | the floor never advanced, so nothing could be freed |
+* the flags reach the process — `raft-compact-every-operations 20` appears in the node's own
+  recorded command line;
+* Kommander's logging *is* captured — its `[endpoint/partition]` message prefix appears throughout;
+* the string `Compaction` appears **0 times in a 62,887-line node log**.
 
-If `:compaction-started` is 0 the threshold is still too high for that workload's per-partition
-write rate. If it is non-zero and `:compaction-blocked` is too, the WAL cannot shrink regardless of
-the threshold and this is a server condition rather than a calibration one. The next run answers it
-without another guess.
+So the WAL never compacts, and the markers are measuring a real absence of output rather than a
+capture problem.
 
-Related: `register / kill,placement` at **RF 1** reports `:learners 4` with `:replicas-gained 0` —
-moves started and none completed. That is now reported as `:cause :stalled` rather than `:vacuous`,
-because "the planner is stuck" and "the nemesis did nothing" are different findings and the old
-wording filed the first under the second. At RF 1 a range has one voter, so a replacement has
-nothing to seed from while that voter is down; whether the stall is inherent to the configuration or
-a defect is open.
+**What the markers cannot tell you, contrary to what they were added for.**
+`RunCompactionPassAsync` returns silently twice before its first log line — once when the WAL
+reports no checkpoint (`lastCheckpoint <= 0`) and again when the composed retain floor is at or
+below zero. Both returns are above `LogInfoCompactionStarted`. So `:compaction-started 0` does *not*
+mean "the threshold was never reached": it is equally consistent with a pass firing on every commit
+and returning immediately because nothing has checkpointed. All three markers reading 0 is
+**unresolved**, not a diagnosis, and the docstring now says so.
+
+Filed upstream as Kommander `81492727` — log the early returns, and answer what actually advances
+`GetLastCheckpoint`. Until then the harness cannot distinguish a calibration problem from a stalled
+checkpoint, and guessing at a fourth threshold would be the third guess in a row.
+
+One detail argues against "the threshold is still too high": the same configuration produced
+`imported 4` in one run and `imported 0` in the next, on consecutive builds. A threshold that is
+merely too high does not vary like that; something intermittent gates the checkpoint.
+
+Related, and separate: `register / kill,placement` at **RF 1** reports `:learners 4` with
+`:replicas-gained 0` — moves started and none completed. That is now `:cause :stalled` rather than
+`:vacuous`, because "the planner is stuck" and "the nemesis did nothing" are different findings and
+the old wording filed the first under the second. At RF 1 a range has one voter, so a replacement
+has nothing to seed from while that voter is down; whether the stall is inherent to the
+configuration or a defect is open.
 
 ## Closed: "mutual exclusion violated" was a bug in *this* checker
 
