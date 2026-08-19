@@ -245,6 +245,19 @@ jobs:
           # ran too early or a seed that arrived incomplete. It is also the
           # profile where a repair is unavoidable -- kill the node holding a
           # range and the planner has to rebuild it somewhere else from nothing.
+          #
+          # `placement_nodes_out: none` drops the decommission and keeps the
+          # replication-factor overrides. Kommander documents RF-1 decommission
+          # as unsupported (`b2e2ee03`: a range with one voter has nowhere to
+          # hand off, so the drain works only while the leaver keeps that
+          # range's leadership), and run 32175423183 showed what testing it
+          # anyway buys: the drain timed out, the node stayed `Leaving` for the
+          # rest of the run, and its range never elected a leader again. That is
+          # a real defect -- filed against `b2e2ee03`, whose acceptance says the
+          # rollback must be clean -- but it is not what this job is for, and it
+          # masks what this job is for. Raising and clearing an override still
+          # makes the planner add, seed, promote and retire replicas, which is
+          # the repair path RF 1 is here to stress.
           - workload: register
             faults: kill,placement
             nodes: n1,n2,n3,n4,n5,n6
@@ -254,6 +267,7 @@ jobs:
             time_limit: 600
             partitions: 8
             replication_factor: 1
+            placement_nodes_out: none
             force_compaction: true
           # Scale-down: walk the roster from six nodes toward the replication
           # factor and back. The planner must degrade toward fuller replication
@@ -316,6 +330,35 @@ jobs:
             partitions: 8
             key_count: 25
             key_range: true
+          # The control's control. `append / range` found `:G-single-item` read
+          # skew (`cfbb55d2`) on run 32175423183 with nothing injected but
+          # splits and merges: no partition, no kill, no placement, one replica
+          # per partition. The keys involved sat on two partitions whose
+          # boundaries had been stable for three minutes either side of the
+          # cycle, so the split is excluded and what is left is cross-partition
+          # read isolation in an interactive transaction.
+          #
+          # Which leaves one variable untested: routing mode. This job is the
+          # job above with `--key-range` and the range fault removed and nothing
+          # else changed, so the keys are hash-spread instead of range-routed
+          # and the transactions genuinely span partitions rather than being
+          # collapsed onto one descriptor. If read skew reproduces here, routing
+          # is incidental and the defect is in the transaction path. If it does
+          # not, key-range routing is load-bearing and worth saying so.
+          #
+          # The existing hash-routed `append` jobs cannot answer this: they run
+          # 5 keys, not 25, which is a different transaction shape.
+          #
+          # `faults: none` is a fault-free run -- the first in this matrix. It
+          # is also the cheapest job here, so it costs little to keep even once
+          # it has answered the question.
+          - workload: append
+            faults: none
+            concurrency: 5
+            ops_per_key: 60
+            time_limit: 600
+            partitions: 8
+            key_count: 25
           # Scenario 8 proper: split and merge under a replication factor with
           # concurrent writers. The copy goes through the destination
           # partition's Raft log, so a kill landing right after cutover is the
@@ -473,6 +516,15 @@ jobs:
         # --key-range is the one flag here that changes what the cluster *does*
         # rather than only what the harness does -- it registers the workload's
         # key space for key-order routing before any client starts.
+        #
+        # --placement-nodes-out renders the whole flag rather than just its
+        # value, and spells zero `none`, because `x || 1` cannot express zero
+        # here: GitHub casts both sides of a comparison to a number, so 0 is
+        # falsy *and* `0 == null` is true. Either spelling of zero silently
+        # becomes 1, which would put the decommission back into the one job
+        # that must not have it. A string sentinel casts to NaN and compares
+        # false against everything, which is the only form that survives unset,
+        # zero and a positive value alike.
         run: |
           lein with-profile +ci run test \
             --workload ${{ matrix.workload }} \
@@ -492,7 +544,7 @@ jobs:
             --partitions ${{ matrix.partitions || 3 }} \
             --replication-factor ${{ matrix.replication_factor || 0 }} \
             --placement-interval ${{ matrix.placement_interval || 30 }} \
-            --placement-nodes-out ${{ matrix.placement_nodes_out || 1 }} \
+            ${{ matrix.placement_nodes_out == 'none' && '--placement-nodes-out 0' || format('--placement-nodes-out {0}', matrix.placement_nodes_out || 1) }} \
             --decommission-drain-timeout ${{ matrix.decommission_drain_timeout || 60000 }} \
             --range-interval ${{ matrix.range_interval || 20 }} \
             ${{ matrix.force_compaction && '--force-compaction' || '' }} \

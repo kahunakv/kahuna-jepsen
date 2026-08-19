@@ -48,9 +48,16 @@
   kahuna.nemesis.range."
   #{:partition :kill :pause :membership :placement :range})
 
-(defn parse-faults [s]
-  (if (= s "all")
-    all-faults
+(defn parse-faults
+  "'all' is every fault above; 'none' is the fault-free control. 'none' is
+  spelled out rather than accepting an empty string for the same reason
+  --require-placement-evidence does: running with no nemesis at all is a
+  decision worth seeing on the command line, not something a stray comma
+  should produce."
+  [s]
+  (case s
+    "all"  all-faults
+    "none" #{}
     (set (map keyword (str/split s #",")))))
 
 (def kill-targets
@@ -171,7 +178,12 @@
             ;; nothing about full replication and vice versa, and store/ is
             ;; keyed by this string.
             :name       (str "kahuna-" (name (:workload opts))
-                             "-" (str/join "," (map name (sort faults)))
+                             ;; A fault-free control is named for what it is.
+                             ;; The alternative is a trailing dash, and store/
+                             ;; is keyed by this string.
+                             "-" (if (seq faults)
+                                   (str/join "," (map name (sort faults)))
+                                   "nofaults")
                              (when (pos? (:replication-factor opts 0))
                                (str "-rf" (:replication-factor opts)))
                              ;; Same reasoning as the factor: key-range routing
@@ -225,7 +237,8 @@
    [nil "--tarball PATH" "Path (on the control node) to the Kahuna tarball"
     :default "target/kahuna.tar.gz"]
 
-   [nil "--faults FAULTS" "Comma-separated nemesis faults, or 'all'"
+   [nil "--faults FAULTS" "Comma-separated nemesis faults, 'all', or 'none' for
+                          a fault-free control run"
     :default all-faults
     :parse-fn parse-faults]
 
@@ -401,10 +414,18 @@
                                   replication factor, where the planner must
                                   degrade to fuller replication rather than lose
                                   ranges. Clamped so at least max(3, RF) nodes
-                                  remain."
+                                  remain.
+
+                                  0 turns roster churn off entirely: the nemesis
+                                  works replication-factor overrides only, which
+                                  still forces the planner to add and retire
+                                  replicas. That is the setting for a profile
+                                  where decommission is not a supported
+                                  operation — RF 1, where a range has a single
+                                  voter and a drain has nowhere to hand it off."
     :default 1
     :parse-fn read-string
-    :validate [pos? "must be positive"]]
+    :validate [(complement neg?) "must be zero or positive"]]
 
    [nil "--no-placement-sampling" "Stop reading /v1/cluster/placement on a timer.
                                   The placement checker then cannot see a

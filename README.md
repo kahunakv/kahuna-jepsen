@@ -67,7 +67,7 @@ reach for:
 | Flag | Meaning |
 |---|---|
 | `--workload` | `register`, `lock`, `append`, `sequencer` or `snapshot` |
-| `--faults` | comma-separated `partition,kill,pause,membership,placement,range,clock`, or `all` |
+| `--faults` | comma-separated `partition,kill,pause,membership,placement,range,clock`, `all`, or `none` for a fault-free control run |
 | `--replication-factor` | voter replicas per range. 0 (default) is full replication and changes nothing; 3 is the standard placed profile, 1 the highest-signal cheap one |
 | `--key-range` | route the workload's key space by key order instead of by hash, so ranges exist to be split. Off by default and inert for `lock` and `sequencer` |
 | `--kill-targets` | what `kill` aims at: `one,minority,majority,all`. Drop `all` for the `snapshot` workload — a full-cluster kill destroys every live snapshot hold, so the run re-acquires instead of measuring |
@@ -106,6 +106,7 @@ lein run test --workload register \
 | `--force-compaction` | **not optional.** Without it the PITR floor protects 90 minutes of WAL, nothing is ever compacted inside a run, and every replica added by the nemesis catches up from the log — the snapshot-seeding path is never entered |
 | `--faults …,placement` | the fault that moves replicas. `partition`, `kill` and `pause` never do |
 | `--placement-nodes-out 3` | walks the roster down toward the replication factor and back, instead of one leave/rejoin at a time |
+| `--placement-nodes-out 0` | the other end: never touch the roster, work the replication-factor overrides only. Still drives add, seed, promote and retire — what it drops is the decommission, which Kommander does not support at RF 1 |
 
 The run's verdict gains a `:placement` key. It can return `:valid? :unknown` —
 read that as "this run proved nothing", never as a pass:

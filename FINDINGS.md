@@ -51,6 +51,94 @@ Not started:
       (`src/kahuna/checker/range.clj`). **Green 2026-08-17** at RF 0 — six
       splits, two merges, no id reused — see below.
 
+## Open: read skew (`:G-single-item`) with nothing broken at all
+
+Filed as `cfbb55d2`. Run `32175423183`, job `append / range` — **the control**. This is the most
+serious finding the suite has produced, and it is the absences that make it so.
+
+The nemesis op census for the entire 600 s run is `588 :health`, `426 :range-sample`,
+`46 :split-range`, `22 :merge-ranges`. Two of those are read-only probes. There were no partitions,
+no kills, no pauses, no placement, no decommission. RF is the default, one replica per partition, so
+no follower can serve a stale copy and no election can be lost. Every split and merge returned
+`Succeeded`/`Completed` with `determinate true`. A healthy cluster produced a serializability
+violation.
+
+The cycle, reduced:
+
+* **T1** (index 10375, t=490.06 s) reads `201 = [1 2 3 4]`, appends 26 to 199, reads 199, appends
+  26 to **197**.
+* **T2** (index 10443, t=493.24 s) reads `201 = [1..30]`, appends 31 to 201, reads 201, reads
+  **`197 = [1..25]`** — missing the 26 T1 wrote 3.2 seconds earlier.
+
+A `ww` chain on key 201 orders T2 after T1; T2's read of 197 is from before T1. One
+anti-dependency, the rest write-order edges: read skew, which snapshot isolation already forbids.
+
+**And this time the split really is excluded, by construction rather than by timing alone.** Keys
+sort lexicographically, so 197 and 199 lived in `["…/120","…/20")` = partition 18 and 201 in
+`["…/20","…/31")` = partition 16. Both boundaries had been stable since 19:21, three minutes either
+side of the 19:24:11 anomaly. The nearest range operation — a merge completing at 19:24:09.310 —
+combined partitions 13 and 23 and touched neither.
+
+So this is cross-partition read isolation in interactive transactions. Key-range routing's only
+contribution was putting those keys on two different partitions; hash routing would do the same with
+different keys. The same job passed on runs `32084762680` and `32099207501` (17 splits on one), so
+one cycle in three runs — rare enough that a green nightly proves very little.
+
+**What would narrow it:** a hash-routed control at the same shape — `key_count: 25`, concurrency 5,
+no `--key-range`, no faults. The existing hash-routed `append` jobs run 5 keys, which is not a
+like-for-like comparison, so right now we cannot say whether routing mode matters. **Now in the
+matrix** as `append / none` (`kahuna-append-nofaults`): the same job with `--key-range` and the
+range fault removed and nothing else changed, so the keys hash-spread and the transactions genuinely
+span partitions instead of collapsing onto one descriptor. It is the first fault-free job in this
+suite — `--faults none` was added for it, spelled out rather than accepted as an empty string.
+
+If read skew reproduces there, routing is incidental and the defect is in the transaction path. If
+it does not, key-range routing is load-bearing. Either answer is worth having, and the job is the
+cheapest in the matrix.
+
+## Open: a placement-added learner is never promoted, so every drain times out
+
+Filed upstream as Kommander `febc8edc`. Runs `32175423183` jobs `register / placement` (RF 3
+scale-down) and `register / kill,placement` (RF 1). Both report `:cause :stalled`.
+
+The pass adds a `Learner` and nothing ever promotes it. The range is transitional forever, every
+later pass skips it, the drain waiting on it times out, and the rollback removes the learner it just
+added. Over 900 s the scale-down job logged 6 `AddReplica`, **0 `PromoteReplica`**, 3 `RemoveReplica`
+of the learner just added, and 4 × `DrainTimedOut`. Generations advanced from 1 to 5; **not one
+voter set changed**, which is why the checker correctly reports `partitions-moved 0`.
+
+The learner is invisible to its leader. Partition 4's leader n6 logged exactly one line about the
+new learner n3 — `Received handshake from n3:8082/3. WAL log at 0.` — and then nothing: no enqueued
+entries, no backfill decision, no heartbeat, for ten minutes. n6 had been elected before the
+`AddReplica`. Partition 4 carried no writes at all that run, so the learner had nothing to catch up
+on and was still not promoted; whatever gates promotion here, it is not lag.
+
+Two things stop this being read as "the rebalancer is broken again". First, five other placement
+jobs in the same run passed and moved 8–11 partitions each — the `09c99a1` fix holds. Second, one
+promotion *did* succeed (RF 1, partition 8) and produced a `DIAG backfill-decision` line the stuck
+ranges never produce, so the driver can fire. What separates the two cases is the open question.
+
+**The RF 1 job is worse than a stall**, and it violates Kommander's own acceptance criterion for
+`b2e2ee03` ("the leave times out and rolls back cleanly"). n2's role stayed `Leaving` from the
+drain to the end of the run — 721 `Suppressing pre-vote: local role is Leaving` — so it never
+campaigned again, while its only peer was the learner whose votes are refused as "not a committed
+voter". Partition 2 ran 1725 pre-vote rounds at Term=1 and never had a leader again.
+
+Kommander documents RF-1 decommission as unsupported, so the harness should not have been draining
+at RF 1 at all. **Fixed here**: `--placement-nodes-out 0` is now a supported setting meaning "work
+the replication-factor overrides, never touch the roster", and the RF-1 job uses it. Raising and
+clearing an override still drives add, seed, promote and retire, so the job keeps the repair path it
+exists to stress; what it drops is an operation the server does not claim to support. The failed
+rollback is a defect either way and stays filed against `b2e2ee03`.
+
+Expect this job to stay red until the learner-promotion bug lands: an override that raises RF still
+produces learners, and learners are still not being promoted. That is the right reason to be red.
+
+Also spotted in both jobs, and reported without a claim attached: `Suppressing pre-vote: local role
+is Voter, not Voter` — 5283 and 7912 occurrences, the most common suppression reason in each. The
+guard prints a role that satisfies its own stated condition. We have not shown it blocks an election
+that should have been won.
+
 ## Closed: the key-range profile runs, and splits work under chaos
 
 Scenario 8 of the placement spec — split/merge under concurrent writers — was
@@ -240,6 +328,16 @@ descriptor router instead of the hash locator. `append / partition`, `append / p
 n = 1, and `partition` and `placement` are both still in play. The spec names the control run that
 would settle it: `append / range` at RF 0, no other faults.
 
+**Closed on `568463e`, then reopened the same day.** The control ran green three times and the
+anomaly was found to have occurred inside an active decommission drain, which gave `568463e`
+(dropping node-local cached key-value entries on snapshot install) a mechanism that fits the cycle's
+shape. That was enough to close it on four clean job-runs instead of this repo's usual 15–30, on the
+argument that an identified mechanism plus a regression test is worth more per run. Then the same
+control produced `:G-single-item` read skew with no faults at all (above). Read skew and write skew
+are different classes, so that is not a refutation — but it removes the *exclusivity* of the drain
+explanation, and the discount on run count went with it. Work `cfbb55d2` first; it may be the same
+timestamp/snapshot defect seen from the other side.
+
 ## Open: snapshot seeding never fires, and the WAL never compacts
 
 Lowering `--raft-compact-every-operations` from 200 to 20 was not the answer, and the markers added
@@ -281,6 +379,27 @@ Related, and separate: `register / kill,placement` at **RF 1** reports `:learner
 the old wording filed the first under the second. At RF 1 a range has one voter, so a replacement
 has nothing to seed from while that voter is down; whether the stall is inherent to the
 configuration or a defect is open.
+
+### Half of this is now answered, and the half that is left is P0 (run `32175423183`)
+
+Kommander's `81492727` logging landed and prints `LastCheckpoint=` on every compaction pass. Reading
+it directly settles the question the markers could not:
+
+* **A continuously-written partition now checkpoints.** In `register / placement`, partition 3
+  compacted against a real floor on every node that hosted it — 658, 656, 328 and 204 passes with a
+  numeric `LastCheckpoint`, against 10, 11, 5 and 2 in the start-of-life window before the first
+  checkpoint. Kahuna's `d89858d0` looks fixed for user partitions.
+* **The system partition never checkpoints.** Every remaining `LastCheckpoint=-1` outside that
+  window is partition 0, and no node ever logs a numeric checkpoint for it. Kommander now says so in
+  as many words: *"Compaction is running but has never had a checkpoint to compact to … the WAL will
+  grow until then."* 43 such passes on P0 across the RF 1 job's five nodes. P0 carries the roster and
+  the placement map and is written on every replica move, so its WAL grows for the life of the
+  process. Appended to `d89858d0`.
+
+So the earlier note that all three markers reading 0 was "unresolved, not a diagnosis" was the right
+call, and the diagnosis has now arrived from the server side rather than from the harness. The
+`imported 0` in these two jobs is downstream of the learner never being promoted (above), not of the
+checkpoint.
 
 ## Closed: "mutual exclusion violated" was a bug in *this* checker
 

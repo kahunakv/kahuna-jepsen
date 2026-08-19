@@ -300,16 +300,24 @@
   then puts every node back before starting again. With the default of one node
   out this is the obvious leave/rejoin cycle; at three it walks a six-node
   cluster down to three and back, which is the scale-down scenario — the planner
-  must degrade toward fuller replication rather than drop ranges on the floor."
+  must degrade toward fuller replication rather than drop ranges on the floor.
+
+  At zero the roster never changes and only the overrides run. Raising and
+  clearing a range's replication factor still makes the planner add, seed,
+  promote and retire replicas, so the fault keeps its point; what it drops is
+  the drain, which is not a supported operation on every profile."
   [nodes-out]
-  (let [n (max 1 nodes-out)]
-    (cycle
-      (concat
-        (mapcat (fn [_] [{:type :info, :f :decommission}
-                         {:type :info, :f :set-rf}
-                         {:type :info, :f :clear-rf}])
-                (range n))
-        (repeat n {:type :info, :f :recommission})))))
+  (let [n (max 0 nodes-out)]
+    (if (zero? n)
+      (cycle [{:type :info, :f :set-rf}
+              {:type :info, :f :clear-rf}])
+      (cycle
+        (concat
+          (mapcat (fn [_] [{:type :info, :f :decommission}
+                           {:type :info, :f :set-rf}
+                           {:type :info, :f :clear-rf}])
+                  (range n))
+          (repeat n {:type :info, :f :recommission}))))))
 
 (defn package
   "A nemesis package for placement churn, shaped like the ones
@@ -338,7 +346,9 @@
      ;; Everything comes back before the final read, so the last generator phase
      ;; runs against a whole roster. One :recommission per node that could be
      ;; out — the nemesis answers :nobody-out for the extras, which is cheap.
-     :final-generator (repeat (max 1 (:placement-nodes-out opts 1))
+     ;; Nothing to put back when roster churn is off, and an empty final
+     ;; generator is the honest way to say so.
+     :final-generator (repeat (max 0 (:placement-nodes-out opts 1))
                               {:type :info, :f :recommission})
      :nemesis         (nemesis opts)
      :perf            #{{:name  "placement"
