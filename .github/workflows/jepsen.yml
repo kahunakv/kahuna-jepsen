@@ -246,18 +246,49 @@ jobs:
           # profile where a repair is unavoidable -- kill the node holding a
           # range and the planner has to rebuild it somewhere else from nothing.
           #
-          # `placement_nodes_out: none` drops the decommission and keeps the
-          # replication-factor overrides. Kommander documents RF-1 decommission
-          # as unsupported (`b2e2ee03`: a range with one voter has nowhere to
-          # hand off, so the drain works only while the leaver keeps that
-          # range's leadership), and run 32175423183 showed what testing it
-          # anyway buys: the drain timed out, the node stayed `Leaving` for the
-          # rest of the run, and its range never elected a leader again. That is
-          # a real defect -- filed against `b2e2ee03`, whose acceptance says the
-          # rollback must be clean -- but it is not what this job is for, and it
-          # masks what this job is for. Raising and clearing an override still
-          # makes the planner add, seed, promote and retire replicas, which is
-          # the repair path RF 1 is here to stress.
+          # The decommission is deliberately kept here, after a round trip that
+          # is worth recording. It was dropped on 2026-08-18 (via
+          # `placement_nodes_out: none`) because Kommander documents RF-1
+          # decommission as unsupported -- `b2e2ee03`: a range with one voter
+          # has nowhere to hand off, so the drain works only while the leaver
+          # keeps that range's leadership -- and run 32175423183 had shown the
+          # drain timing out, the node stuck at `Leaving`, and its range never
+          # electing a leader again.
+          #
+          # Dropping it cost more than it saved. Run 32203864431 was the only
+          # job in the matrix to report `:cause :vacuous, :missing [:seeding]`:
+          # `set-rf` raises the factor on a *live* partition whose WAL is
+          # intact, so the new learner backfills from the log and no
+          # whole-partition snapshot is ever sent. The decommission was the only
+          # thing at RF 1 forcing a rebuild from nothing -- which is precisely
+          # the property this job exists to test, since at RF 1 a bad seed is
+          # data loss rather than degradation.
+          #
+          # So it is back, and it now carries a second purpose: it is the only
+          # job that exercises the RF-1 drain-timeout rollback, which is the one
+          # open item on `b2e2ee03`. A `DrainTimedOut` here is expected and is
+          # not the failure -- what matters is whether the node returns to
+          # `Voter` afterwards and its range elects a leader again. Read the
+          # node logs for `Suppressing pre-vote: local role is Leaving` before
+          # concluding anything from this job's exit status.
+          #
+          # `partitions: 3`, down from 8, is what actually buys the seeding
+          # evidence back -- the decommission alone does not. A snapshot beats
+          # log replay only when the learner starts *below* the WAL compaction
+          # floor, and compaction is scheduled per partition every
+          # --raft-compact-every-operations writes. Passes therefore scale with
+          # replicas x writes, and RF 1 writes one WAL per operation where RF 3
+          # writes three. On run 32203864431 this job managed 20 compaction
+          # passes against 928 and 1188 for the RF-3 jobs, so its floor never
+          # left zero, so every learner was already at the floor and backfilled
+          # from the log. Concentrating the same write volume into three
+          # partitions raises per-partition traffic ~2.7x, which is what moves
+          # the floor. Same finding as "the compaction profile never fired,
+          # because the threshold is per partition" in FINDINGS.md.
+          #
+          # Nothing is weakened by the drop: six nodes at RF 1 is still one
+          # replica per range with no second copy to hide an incomplete seed,
+          # which is the whole point of the profile.
           - workload: register
             faults: kill,placement
             nodes: n1,n2,n3,n4,n5,n6
@@ -265,9 +296,8 @@ jobs:
             ops_per_key: 40
             kill_targets: one
             time_limit: 600
-            partitions: 8
+            partitions: 3
             replication_factor: 1
-            placement_nodes_out: none
             force_compaction: true
           # Scale-down: walk the roster from six nodes toward the replication
           # factor and back. The planner must degrade toward fuller replication
@@ -517,8 +547,11 @@ jobs:
         # rather than only what the harness does -- it registers the workload's
         # key space for key-order routing before any client starts.
         #
-        # --placement-nodes-out renders the whole flag rather than just its
-        # value, and spells zero `none`, because `x || 1` cannot express zero
+        # --placement-nodes-out: no job sets `none` today (the RF-1 job that did
+        # has its decommission back), but the rendering below stays as it is
+        # rather than reverting to `x || 1`, because the trap it defuses is
+        # silent. It renders the whole flag rather than just its value, and
+        # spells zero `none`, because `x || 1` cannot express zero
         # here: GitHub casts both sides of a comparison to a number, so 0 is
         # falsy *and* `0 == null` is true. Either spelling of zero silently
         # becomes 1, which would put the decommission back into the one job

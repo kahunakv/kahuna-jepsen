@@ -96,7 +96,47 @@ If read skew reproduces there, routing is incidental and the defect is in the tr
 it does not, key-range routing is load-bearing. Either answer is worth having, and the job is the
 cheapest in the matrix.
 
-## Open: a placement-added learner is never promoted, so every drain times out
+**First result (run `32203864431`): both clean** — `append / range` passed with 17 splits, and the
+new `append / none` passed. That is worth very little. The base rate is one cycle in three 600 s
+runs, so a single clean run of each neither confirms a fix nor answers the routing question: it
+cannot separate "hash routing is unaffected" from "the interleaving did not happen this time". The
+control needs runs, not a run. Recorded here because closing a 1-in-3 anomaly on one green is the
+same error `fe248fe4` was closed and reopened on within a day.
+
+## Closed: a placement-added learner was never promoted, so every drain timed out
+
+**Fixed and verified on run `32203864431` (2026-08-19).** 24 of 25 jobs pass. The signature has
+inverted on every job carrying the placement fault, and the scale-down job that this was filed from
+went from proving nothing to passing outright:
+
+| `register / placement`, 900 s, RF 3 | before | after |
+|---|---|---|
+| `AddReplica` / `PromoteReplica` / `RemoveReplica` | 6 / **0** / 3 | 11 / **7** / 12 |
+| `replicas-gained`, `partitions-moved` | 0, 0 | 7, 4 |
+| verdict | `:unknown, :cause :stalled` | `:valid? true` |
+
+All six RF-3 placement jobs now move replicas (7–38 gained, 4–9 partitions moved) and all six pass.
+Snapshot seeding, which was `imported 0 / exported 0` in both failing jobs, now fires in every one
+of them — `imported` 2–7, `exported` 3–32 — so `PartitionStateTransfer` is being exercised rather
+than merely not failing.
+
+**The first drain in this suite's history completed**: `{:drained true, :outcome "Committed",
+:left true}`. Five of that job's six decommissions still return `DrainTimedOut`, but that is a
+different problem from the one above — moves complete, they just do not all finish inside the 60 s
+`--decommission-drain-timeout` this matrix sets. With evacuation actually working, that budget is
+now the binding constraint and probably wants raising; see the note below.
+
+The self-contradicting guard is fixed too: `Suppressing pre-vote: local role is Voter, not Voter`
+now reads `roster role Voter, voter of this partition=False`, which states an actual condition. No
+`Leaving` suppression appears anywhere in the run.
+
+What remains open is narrow and is recorded on Kommander's `b2e2ee03`: the RF-1 rollback defect is
+now **unobserved rather than fixed**, because the harness change below removed the only job that
+exercised it.
+
+### The original report
+
+
 
 Filed upstream as Kommander `febc8edc`. Runs `32175423183` jobs `register / placement` (RF 3
 scale-down) and `register / kill,placement` (RF 1). Both report `:cause :stalled`.
@@ -133,6 +173,61 @@ rollback is a defect either way and stays filed against `b2e2ee03`.
 
 Expect this job to stay red until the learner-promotion bug lands: an override that raises RF still
 produces learners, and learners are still not being promoted. That is the right reason to be red.
+
+**It stayed red, for a reason I caused.** On run `32203864431` the promotion fix landed and this job
+moved 7 replicas across 4 partitions with a clean workload verdict — but it is the one job in the
+matrix still reporting `:valid? :unknown`, now `:cause :vacuous, :missing [:seeding]` with
+`imported 0 / exported 0`. Every other placement job seeded 2–7 partitions.
+
+The cause is the change above. Dropping the decommission removed the operation that forced a
+from-nothing rebuild at RF 1: `set-rf` raises the factor on a *live* partition whose WAL is intact,
+so the new learner backfills from the log and no whole-partition snapshot is ever sent. The vacuity
+gate is asking this job for evidence its new shape does not naturally produce.
+
+**Resolved: the decommission is back, and the partition count came down with it.** Of the three
+options — scope the gate down, restore the decommission, or leave the job red — the second is the
+only one that recovers what was lost rather than agreeing to stop looking for it.
+
+**But the decommission alone would not have fixed the missing seeding, and it is worth being exact
+about why.** A snapshot beats log replay only when the learner starts *below* the WAL compaction
+floor. Compaction is scheduled per partition every `--raft-compact-every-operations` writes, so
+passes scale with replicas × writes — and RF 1 writes one WAL per operation where RF 3 writes three:
+
+| Job | compaction passes | `imported` | `exported` |
+|---|---|---|---|
+| `register / kill,placement` (RF 1, 600 s, 8 partitions) | **20** | 0 | 0 |
+| `register / placement` (RF 3, 900 s) | 928 | 2 | 3 |
+| `append / partition,placement` (RF 3, 900 s) | 1188 | 3 | 13 |
+
+Twenty passes leaves the floor at essentially zero, so every learner was *already* at the floor and
+backfilled from the log. No snapshot was needed, so none was sent. The decommission adds un-host and
+purge events — that marker was already at 4 without it — but `purge` was never the missing evidence;
+`seeding` was.
+
+So the job also drops from 8 partitions to 3, concentrating the same write volume ~2.7× per
+partition, which is what actually moves the floor. This is the same mechanism as *"the compaction
+profile never fired, because the threshold is per partition"* below, rediscovered one replication
+factor down. Six nodes at RF 1 with 3 partitions is still one replica per range with no second copy
+to hide an incomplete seed, so nothing the profile exists to test is given up. At RF 1 a replica arriving incomplete is data loss, not
+degradation, and the decommission was the only operation at that factor forcing a rebuild from
+nothing. Scoping the gate to `move,purge` would have made the job green by lowering what it claims,
+which is the move this suite has been burned by before.
+
+Restoring it also gives the job a second purpose it did not have when it was written: it is now the
+only job exercising the RF-1 drain-timeout rollback, which is the one open item on Kommander's
+`b2e2ee03`. That question had become unobservable when the fault was dropped.
+
+**A `DrainTimedOut` here is expected and is not the failure.** RF-1 decommission is documented
+unsupported precisely because a range with one voter has nowhere to hand off. What the job is
+watching is what happens *after* the timeout: whether the node returns to `Voter` and its range
+elects a leader again. Grep the node logs for `Suppressing pre-vote: local role is Leaving` — 721
+occurrences on one node was the wedge, zero is the fix — before drawing any conclusion from the
+job's exit status.
+
+`--placement-nodes-out 0` stays as a supported setting with its tests, unused by the matrix. The
+workflow's rendering of that flag also stays as it is rather than reverting to `x || 1`, because the
+trap it defuses is silent: GitHub casts comparison operands to numbers, so both `0` and `null` are
+falsy and either spelling of zero would quietly become 1.
 
 Also spotted in both jobs, and reported without a claim attached: `Suppressing pre-vote: local role
 is Voter, not Voter` — 5283 and 7912 occurrences, the most common suppression reason in each. The
