@@ -265,38 +265,40 @@ jobs:
           # data loss rather than degradation.
           #
           # So it is back, and it now carries a second purpose: it is the only
-          # job that exercises the RF-1 drain-timeout rollback, which is the one
-          # open item on `b2e2ee03`. A `DrainTimedOut` here is expected and is
-          # not the failure -- what matters is whether the node returns to
-          # `Voter` afterwards and its range elects a leader again. Read the
-          # node logs for `Suppressing pre-vote: local role is Leaving` before
-          # concluding anything from this job's exit status.
+          # job that exercises the RF-1 drain, which was the one open item on
+          # `b2e2ee03`. Run 32206164668 answered it: the drain **committed**
+          # (`{:drained true, :outcome "Committed", :left true}`) with no
+          # timeout at all, and `Suppressing pre-vote: local role is Leaving`
+          # appears zero times across all six node logs where the wedge had 721
+          # on one node. A `DrainTimedOut` here would still be expected rather
+          # than a failure -- what matters is whether the node returns to
+          # `Voter` and its range elects a leader again, which is a node-log
+          # question, not an exit-status one.
           #
-          # `partitions: 3`, down from 8, is what actually buys the seeding
-          # evidence back -- the decommission alone does not. A snapshot beats
-          # log replay only when the learner starts *below* the WAL compaction
-          # floor, and compaction is scheduled per partition every
-          # --raft-compact-every-operations writes. Passes therefore scale with
-          # replicas x writes, and RF 1 writes one WAL per operation where RF 3
-          # writes three. On run 32203864431 this job managed 20 compaction
-          # passes against 928 and 1188 for the RF-3 jobs, so its floor never
-          # left zero, so every learner was already at the floor and backfilled
-          # from the log. Concentrating the same write volume into three
-          # partitions raises per-partition traffic ~2.7x, which is what moves
-          # the floor. Same finding as "the compaction profile never fired,
-          # because the threshold is per partition" in FINDINGS.md.
+          # `key_count: 25` is the seeding lever. The evidence gate wants a
+          # whole-partition snapshot, and a snapshot beats log replay only when
+          # the learner starts *below* the WAL compaction floor -- which needs
+          # the floor to have moved, which needs writes. This job runs at the
+          # default of 5 keys and commits far less than the RF-3 jobs do, so its
+          # floor stays near zero and every learner backfills from the log.
           #
-          # Nothing is weakened by the drop: six nodes at RF 1 is still one
-          # replica per range with no second copy to hide an incomplete seed,
-          # which is the whole point of the profile.
+          # An earlier attempt cut partitions from 8 to 3 on the theory that
+          # concentrating writes raises per-partition traffic past the per-
+          # partition compaction threshold. It backfired: compaction passes went
+          # 20 -> 6 and successful operations 928 -> 331. With `kill_targets:
+          # one` at RF 1, three partitions means a kill removes a third of the
+          # key space instead of an eighth and there is no replica to fail over
+          # to, so throughput collapsed and took the write volume with it.
+          # Partition count is not the lever; total writes are. Hence 8 again.
           - workload: register
             faults: kill,placement
             nodes: n1,n2,n3,n4,n5,n6
             concurrency: 9
             ops_per_key: 40
+            key_count: 25
             kill_targets: one
             time_limit: 600
-            partitions: 3
+            partitions: 8
             replication_factor: 1
             force_compaction: true
           # Scale-down: walk the roster from six nodes toward the replication

@@ -73,16 +73,41 @@ The cycle, reduced:
 A `ww` chain on key 201 orders T2 after T1; T2's read of 197 is from before T1. One
 anti-dependency, the rest write-order edges: read skew, which snapshot isolation already forbids.
 
-**And this time the split really is excluded, by construction rather than by timing alone.** Keys
-sort lexicographically, so 197 and 199 lived in `["…/120","…/20")` = partition 18 and 201 in
-`["…/20","…/31")` = partition 16. Both boundaries had been stable since 19:21, three minutes either
-side of the 19:24:11 anomaly. The nearest range operation — a merge completing at 19:24:09.310 —
-combined partitions 13 and 23 and touched neither.
+### ~~The split is excluded~~ — wrong, and root-caused server-side
 
-So this is cross-partition read isolation in interactive transactions. Key-range routing's only
-contribution was putting those keys on two different partitions; hash routing would do the same with
-different keys. The same job passed on runs `32084762680` and `32099207501` (17 splits on one), so
-one cycle in three runs — rare enough that a green nightly proves very little.
+This entry originally claimed, in bold, that *"this time the split really is excluded, by
+construction rather than by timing alone"*: 197 and 199 in `["…/120","…/20")` = partition 18, 201 in
+`["…/20","…/31")` = partition 16, both boundaries stable since 19:21, the nearest range op a merge
+of partitions 13 and 23 touching neither.
+
+**That was wrong, and the error was mine.** Reading the run's own artifact server-side (see
+`cfbb55d2`) found:
+
+1. **It is the split.** A `:split-range` ran t=490.160 → 493.064 — precisely the window between
+   T1's commit at 490.064 and T2's stale read at 493.243 — and it split **partition 18's own range**
+   at `…/149`, moving keys 197 and 199 to a newly created **partition 26**. The map quoted above is
+   the *post-split* sample; the "stable for three minutes" reading came from comparing it against
+   itself instead of against the map in force at the anomaly.
+2. **The stale read was served by the new partition's leader**, n5, not by partition 18's owner n4.
+   n4 answered `[..26]` correctly at t=490.142; T2's read at 493.243 hit n5 and got the pre-commit
+   base `[..25]`.
+
+The mechanism is cutover-under-unsettled-intents: T1's value existed only as a committed-but-
+unsettled prepared intent, reads served it through the intent overlay, and the split's data copy
+captures base rows. Fixed with a settle-before-cutover barrier, plus an export-truncation fix and
+straggler re-routing — details on the spec.
+
+Two lessons worth keeping, since this is the second time in two days a range finding has been
+misread from sampled maps:
+
+* **A `:range-sample` is a sample, not a timeline.** Establishing that a boundary did not move
+  requires reading the split/merge op log across the window, not comparing two samples that may both
+  post-date the event.
+* The suite has now twice concluded "not the split" and been wrong once. Prefer "no evidence of a
+  split in this window" over "the split is excluded" unless the op log has actually been walked.
+
+The rest of this entry — the cycle itself, its shape, and its rarity — stands. The same job passed
+on runs `32084762680` and `32099207501` (17 splits on one), so one cycle in three runs.
 
 **What would narrow it:** a hash-routed control at the same shape — `key_count: 25`, concurrency 5,
 no `--key-range`, no faults. The existing hash-routed `append` jobs run 5 keys, which is not a
@@ -204,11 +229,38 @@ backfilled from the log. No snapshot was needed, so none was sent. The decommiss
 purge events — that marker was already at 4 without it — but `purge` was never the missing evidence;
 `seeding` was.
 
-So the job also drops from 8 partitions to 3, concentrating the same write volume ~2.7× per
-partition, which is what actually moves the floor. This is the same mechanism as *"the compaction
-profile never fired, because the threshold is per partition"* below, rediscovered one replication
-factor down. Six nodes at RF 1 with 3 partitions is still one replica per range with no second copy
-to hide an incomplete seed, so nothing the profile exists to test is given up. At RF 1 a replica arriving incomplete is data loss, not
+### The partition-count theory was wrong, and the run said so immediately
+
+The first attempt cut the job from 8 partitions to 3, reasoning that concentrating the same write
+volume raises per-partition traffic past the per-partition compaction threshold — the same mechanism
+as *"the compaction profile never fired, because the threshold is per partition"* below. It
+predicted ~2.7× more compaction passes. Run `32206164668` delivered the opposite:
+
+| | 8 partitions | 3 partitions |
+|---|---|---|
+| compaction passes | 20 | **6** |
+| successful operations | 928 | **331** |
+| `imported` / `exported` | 0 / 0 | 0 / 0 |
+
+The missing term was `kill_targets: one` at RF 1. With three partitions a kill removes a third of
+the key space instead of an eighth, and at RF 1 there is no replica to fail over to — so throughput
+collapsed, and total writes went with it. Compaction passes track total writes; redistributing the
+same writes across fewer partitions does not create more of them, and here it destroyed them.
+
+**Partition count is not the lever. Total write volume is.** Reverted to 8 partitions, and
+`key_count` raised from the default 5 to 25 — the same key space the `append` jobs use. Whether that
+is enough to lift the floor far enough for a learner to start below it is still an open question,
+and the honest fallback if it is not is to scope this job's evidence to `move,purge` and let the six
+RF-3 jobs carry the seeding coverage.
+
+### What the run did settle: the RF-1 drain works
+
+`{:drained true, :outcome "Committed", :left true}` — an RF-1 decommission committed with no timeout
+at all, and `Suppressing pre-vote: local role is Leaving` appears **zero** times across all six node
+logs, against 721 on a single node when it was wedged. `AddReplica 7 → PromoteReplica 5 →
+RemoveReplica 4`. That closes the last open item on Kommander's `b2e2ee03`, and it is only
+observable because the decommission was restored — which was the right call independent of the
+seeding gate it was meant to fix. At RF 1 a replica arriving incomplete is data loss, not
 degradation, and the decommission was the only operation at that factor forcing a rebuild from
 nothing. Scoping the gate to `move,purge` would have made the job green by lowering what it claims,
 which is the move this suite has been burned by before.
@@ -374,6 +426,65 @@ Twelve attempts is not a result, both RF 3 jobs also carry `partition`, and `Tra
 `determinate: false` by contract — the harness files it apart from refusals so a run cannot
 manufacture a finding from it. The two control runs that would settle it (RF 3 + `placement,range`
 with no network fault; RF 3 + `partition,range` with nothing moving) are named in the spec.
+
+### Still happening, and intermittent (run `32206164668`)
+
+`register / partition,kill,placement,range` failed on the range vacuity gate — `:cause :vacuous,
+:missing [:split]` — because not one split completed:
+
+```clojure
+:splits {:ops 22, :attempted 11, :succeeded 0, :refused 0, :creation-failed 0,
+         :outcomes {"TransferFailed" 8, "Indeterminate" 3},
+         :skipped {:no-split-key 11}}
+:layouts [[[nil nil 4 1]]]      ; one whole-space descriptor all run
+```
+
+Eight of eleven attempts died in the copy phase. Merges were unaffected (7 of 7 `Completed`), and
+the workload itself is clean (`:linear {:valid? true}`) — so this is the split path specifically,
+not general instability.
+
+**Do not read this as the old defect recurring.** The `cfbb55d2` fix deliberately changed what
+`TransferFailed` means. `KvStateMachineTransfer.ExportRangeAsync` used to treat a refused scan page
+(`MustRetry` / `WaitingForReplication`) as "no data" and emit a clean terminal sentinel — a silently
+truncated copy reported as a successful split. It now fails the export, and the splitter surfaces
+that as a retryable `TransferFailed`. The follow-up discovery on that spec is the part that matters
+here: the legacy copy path scanned as transaction Zero, and the split's own quiesce range lock
+stamps a write intent on every resident key, so a tx-zero scan met those intents and answered
+`MustRetry` for the whole page — meaning **every legacy split with resident keys was silently
+exporting nothing**.
+
+So 8 loud `TransferFailed` where the previous run reported successes is most plausibly the new
+detection working, not a regression. The previous run's "successes" are the ones now in question.
+
+That left a harness problem rather than a server one: `kahuna.nemesis.range` only advanced to the
+next node for `#{"NotLeader" :unreachable}` and otherwise stopped, so a refused export ended the
+attempt. Under a write-heavy workload that starves a run of splits entirely and fails the vacuity
+gate — which is what happened.
+
+**Fixed, and the safety argument is the interesting part.** The obvious change — retry on
+`TransferFailed` — is not safe as stated. `kahuna.client/split-range!`'s own docstring is explicit
+that `TransferFailed` comes back `determinate: false`, meaning the split transaction was already
+under way and the map may still change after the call returns; reissuing it would be two cutovers
+racing on one range, and the resulting map would be *this nemesis's* doing rather than Kahuna's.
+That is precisely how a harness manufactures a finding.
+
+So the retry is gated on proof that the first attempt landed nothing, and there are two of them:
+
+* the server says so — `determinate true` is the contract's final answer; or
+* **the range map is unchanged across the attempt**, which is the re-read the client docstring
+  already prescribes for an indeterminate answer.
+
+If the map moved, the attempt is not reissued. No proof, no retry. Three attempts per operation with
+a 1 s / 2 s backoff, abandoned attempts recorded under `:retries` so the history distinguishes a
+split that needed three tries from one that worked first time. Merges get the same treatment — a
+merge copies through the destination's log too and refuses a contended page the same way.
+
+`kahuna.checker.range` is unchanged: a retryable refusal still lands in `:indeterminate`. Counting
+it separately is still worth doing, but it is cosmetic next to the nemesis no longer giving up.
+
+The `:no-split-key 11` skips are unrelated and expected: `register` runs 5 keys by default, so the
+key space runs out of bisection points quickly. They are skips, not failures, and they are why 22
+ops yielded only 11 attempts.
 
 ## Open: fencing tokens go backwards and get reused under replica placement
 

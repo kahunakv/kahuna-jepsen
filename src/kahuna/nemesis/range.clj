@@ -45,6 +45,26 @@
   nemesis's doing rather than Kahuna's. The rule this file follows is: hunt for
   the leader, then take the first real answer, whatever it is.
 
+  ## …but abandoning every `TransferFailed` starves the run of splits
+
+  That rule was too blunt in one direction. Kahuna's `cfbb55d2` fix changed what
+  `TransferFailed` means: `ExportRangeAsync` used to read a refused scan page
+  (`MustRetry` / `WaitingForReplication`) as \"no data\" and emit a clean
+  terminal sentinel — a silently truncated copy reported as a *successful*
+  split — and it now fails the export loudly instead. Under a write-heavy
+  workload the refusals are routine, so a nemesis that gives up on the first one
+  can spend a whole run without completing a single split. Run 32206164668 did
+  exactly that: 11 attempts, 8 `TransferFailed`, 0 succeeded, and the range
+  checker correctly refused to call it a pass.
+
+  So a failed attempt is retried — but only when the first one provably left
+  nothing behind, which is knowable two ways. Either the server says so
+  (`determinate` true is the contract's final answer), or the range map is
+  unchanged across the attempt, which is the re-read `split-range!`'s own
+  docstring prescribes for an indeterminate answer. If the map moved, the split
+  may have landed and the attempt is not reissued. The conservative case is
+  still the default: no proof, no retry.
+
   ## Sampling, and why it is separate
 
   `sampler-package` records every node's view of the range map on a timer. It is
@@ -129,38 +149,90 @@
   and moving on to the next node would race it."
   #{"NotLeader" :unreachable})
 
-(defn- split!
-  "Splits `space` at `split-key`, trying endpoints until one does more than
-  refuse for lack of leadership.
+(def ^:private retryable-outcomes
+  "Failures worth a second attempt, *if* it can be shown the first left nothing
+  behind. See `retry-safe?` — membership here is necessary, never sufficient.
+
+  `TransferFailed` is the copy phase refusing a scan page rather than silently
+  truncating it, which Kahuna's `cfbb55d2` made a loud, retryable failure. Under
+  a write-heavy workload it is routine, and abandoning the attempt on it costs a
+  run every split it would otherwise have completed."
+  #{"TransferFailed"})
+
+(def ^:private max-attempts
+  "Total tries per operation, including the first. Three is enough to ride out
+  the transient contention `TransferFailed` reports without letting one nemesis
+  op eat a meaningful slice of the interval between faults."
+  3)
+
+(defn- retry-safe?
+  "Whether a failed attempt may be reissued, given the range map digest either
+  side of it.
+
+  Two independent proofs that the first attempt landed nothing. The server
+  saying so — `determinate` true is the contract's 'this is the final answer' —
+  or the map being unchanged across the call, which is the re-read that
+  `kc/split-range!`'s docstring prescribes for an indeterminate answer. Absent
+  either, the split may still be in flight and a second one would race it, so
+  this returns false: the harness must not be the thing that broke the map."
+  [r before after]
+  (boolean (and (retryable-outcomes (:outcome r))
+                (or (:determinate r) (= before after)))))
+
+(defn- hunt!
+  "Calls `call!` on endpoints in turn until one does more than refuse for lack
+  of leadership.
 
   Returns the accepting node's answer with `:attempted true`, or
   `{:attempted false}` when every node refused. 'Nobody would attempt it' and
   'somebody attempted it and it failed' are different findings and this must not
   collapse them."
-  [test space split-key]
+  [test call!]
   (loop [[node & more] (shuffle (vec (:nodes test)))
          refusals      []]
     (if-not node
       {:attempted false :refusals refusals}
-      (let [r (attempt (kc/split-range! node space split-key {})
+      (let [r (attempt (call! node)
                        {:success false :determinate false :outcome :unreachable})]
         (if (not-attempted (:outcome r))
           (recur more (conj refusals [node (:outcome r)]))
           (assoc r :attempted true :accepted-by node :refusals refusals))))))
 
+(defn- with-retry
+  "Runs a leader-hunt, retrying a provably-clean failure up to `max-attempts`.
+
+  `map-digest` is read either side of every attempt, so a retry is only issued
+  against a map that has not moved. Records the abandoned attempts under
+  `:retries` — a run that needed three tries to split is a different fact from
+  one that split first time, and the history should say which."
+  [test call! map-digest]
+  (loop [n 1, retries []]
+    (let [before (map-digest)
+          r      (hunt! test call!)
+          after  (map-digest)]
+      (if (or (:success r)
+              (not (:attempted r))
+              (>= n max-attempts)
+              (not (retry-safe? r before after)))
+        (cond-> r (seq retries) (assoc :retries retries))
+        (do (warn "range: retrying after" (:outcome r) "— attempt" n "of" max-attempts)
+            ;; The contention this reports is transient by nature; retrying into
+            ;; the same write storm immediately would just spend the budget.
+            (Thread/sleep (* 1000 n))
+            (recur (inc n) (conj retries [(:accepted-by r) (:outcome r)])))))))
+
+(defn- split!
+  "Splits `space` at `split-key`, hunting for the leader and retrying a
+  provably-clean failure."
+  [test space split-key map-digest]
+  (with-retry test #(kc/split-range! % space split-key {}) map-digest))
+
 (defn- merge!
-  "Runs the merge pass, trying endpoints until one is the leader. Same
-  leader-hunt and same stopping rule as `split!`."
-  [test]
-  (loop [[node & more] (shuffle (vec (:nodes test)))
-         refusals      []]
-    (if-not node
-      {:attempted false :refusals refusals}
-      (let [r (attempt (kc/merge-ranges! node {})
-                       {:success false :determinate false :outcome :unreachable})]
-        (if (not-attempted (:outcome r))
-          (recur more (conj refusals [node (:outcome r)]))
-          (assoc r :attempted true :accepted-by node :refusals refusals))))))
+  "Runs the merge pass. Same leader-hunt, stopping rule and retry proof as
+  `split!` — a merge copies through the destination's log too, so it refuses a
+  contended scan page the same way."
+  [test map-digest]
+  (with-retry test #(kc/merge-ranges! % {}) map-digest))
 
 (defn digest
   "A compact summary of one key space's descriptors, small enough to sit in the
@@ -193,7 +265,12 @@
             ;; twice would let the history claim the op targeted a layout it did
             ;; not target.
             v0     (view)
-            before (digest v0)]
+            before (digest v0)
+            ;; Read fresh on every call: `with-retry` compares this either side
+            ;; of an attempt to decide whether reissuing it is safe, so a cached
+            ;; value would make every comparison trivially equal and turn the
+            ;; safety check into a rubber stamp.
+            digest-now (fn [] (digest (view)))]
         (letfn [(done [value]
                   (assoc op :value (assoc value
                                           :ranges-before before
@@ -224,7 +301,7 @@
                                    [(:start d) (:end d) (:partition d)]))
                       (let [_ (info "range: splitting" space "at" (:split-key c)
                                     "inside partition" (:partition d))
-                            r (split! test space (:split-key c))]
+                            r (split! test space (:split-key c) digest-now)]
                         (done (merge {:key-space  space
                                       :descriptor [(:start d) (:end d) (:partition d)]
                                       :split-key  (:split-key c)
@@ -233,7 +310,7 @@
 
             :merge-ranges
             (let [_ (info "range: running the merge pass")
-                  r (merge! test)]
+                  r (merge! test digest-now)]
               (done (assoc r :key-space space)))))))
 
     (teardown! [this test])
