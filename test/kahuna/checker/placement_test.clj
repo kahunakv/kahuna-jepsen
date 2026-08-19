@@ -309,3 +309,44 @@
   (let [r (check* base-test [(sample 0 steady) (sample 1000 steady)])]
     (is (= :unknown (:valid? r)))
     (is (= :vacuous (:cause r)))))
+
+
+;; ---------------------------------------------------------------------------
+;; Narrowing the gate for a profile that cannot produce every kind
+;; ---------------------------------------------------------------------------
+;;
+;; The RF-1 job runs `--require-placement-evidence move,purge`, dropping
+;; `seeding`. A snapshot seed only beats log replay when the learner starts
+;; below the WAL compaction floor, and RF 1 never writes enough to move that
+;; floor -- 20 compaction passes against 928 and 1188 in the RF-3 jobs -- so
+;; demanding it there makes the gate a permanent red rather than a signal.
+;;
+;; Narrowing a vacuity gate is the move this suite has been burned by before, so
+;; the two properties worth pinning are both about it *not* becoming a way to
+;; buy a green.
+
+(deftest the-configured-evidence-set-is-honoured-exactly
+  ;; A narrowed requirement must neither reinstate a kind that was dropped nor
+  ;; quietly drop one that was asked for. If `:seeding` ever creeps back into
+  ;; `:evidence-required` for a job that excluded it, that job goes red for a
+  ;; reason its configuration says it should not.
+  (let [r (check* base-test [(sample 0 steady)
+                             (sample 1000 moving)
+                             (sample 2000 moved)])]
+    (is (= [:move] (:evidence-required r)))
+    (is (not (contains? (set (:evidence-required r)) :seeding)))
+    (is (true? (:valid? r)))))
+
+(deftest naming-an-unmeasurable-kind-is-unknown-not-a-pass
+  ;; The abuse this must not permit: narrowing the set to kinds the harness
+  ;; cannot read would turn every run green while proving nothing. `:purge` is
+  ;; log-derived and there are no logs here, so the honest answer is :unknown
+  ;; with the kind named -- :unmeasured invites fixing the observability, where
+  ;; a pass would invite nothing at all.
+  (let [r (check* (assoc base-test :require-placement-evidence #{:move :purge})
+                  [(sample 0 steady)
+                   (sample 1000 moving)
+                   (sample 2000 moved)])]
+    (is (= :unknown (:valid? r)))
+    (is (= :unmeasured (:cause r)))
+    (is (= [:purge] (:unmeasured r)))))

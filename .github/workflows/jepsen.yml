@@ -265,41 +265,69 @@ jobs:
           # data loss rather than degradation.
           #
           # So it is back, and it now carries a second purpose: it is the only
-          # job that exercises the RF-1 drain, which was the one open item on
-          # `b2e2ee03`. Run 32206164668 answered it: the drain **committed**
-          # (`{:drained true, :outcome "Committed", :left true}`) with no
-          # timeout at all, and `Suppressing pre-vote: local role is Leaving`
-          # appears zero times across all six node logs where the wedge had 721
-          # on one node. A `DrainTimedOut` here would still be expected rather
-          # than a failure -- what matters is whether the node returns to
-          # `Voter` and its range elects a leader again, which is a node-log
-          # question, not an exit-status one.
+          # `placement_nodes_out: none` drops the decommission and keeps the
+          # replication-factor overrides, which still make the planner add,
+          # seed, promote and retire replicas. It is here because three runs
+          # measured what the decommission costs this profile, and the answer is
+          # the job itself:
           #
-          # `key_count: 25` is the seeding lever. The evidence gate wants a
-          # whole-partition snapshot, and a snapshot beats log replay only when
-          # the learner starts *below* the WAL compaction floor -- which needs
-          # the floor to have moved, which needs writes. This job runs at the
-          # default of 5 keys and commits far less than the RF-3 jobs do, so its
-          # floor stays near zero and every learner backfills from the log.
+          #   config                              windows  recovered  ok-count
+          #   8 parts, 5 keys, no decommission        20    yes           928
+          #   3 parts, 5 keys, decommission            3    0 of 3        331
+          #   8 parts, 25 keys, decommission           5    0 of 5          3
           #
-          # An earlier attempt cut partitions from 8 to 3 on the theory that
-          # concentrating writes raises per-partition traffic past the per-
-          # partition compaction threshold. It backfired: compaction passes went
-          # 20 -> 6 and successful operations 928 -> 331. With `kill_targets:
-          # one` at RF 1, three partitions means a kill removes a third of the
-          # key space instead of an eighth and there is no replica to fail over
-          # to, so throughput collapsed and took the write volume with it.
-          # Partition count is not the lever; total writes are. Hence 8 again.
+          # The collapse is the decommission, not the tuning either side of it.
+          # A drain blocks the placement nemesis for up to the 60 s timeout, and
+          # -- since the Kommander learner-promotion fix landed -- placement now
+          # genuinely moves replicas, which at RF 1 takes a range offline with
+          # no second copy to serve it. This job's fault budget was calibrated
+          # when the rebalancer was a no-op; it is not survivable now. The last
+          # run committed 3 operations out of 5338 and failed on the `cas`
+          # starvation gate rather than on anything about placement.
+          #
+          # Nothing is lost by dropping it. Kommander documents RF-1
+          # decommission as unsupported, and the one question that justified
+          # testing it anyway -- whether a timed-out drain rolls back cleanly --
+          # was answered by run 32206164668: the drain **committed**
+          # (`{:drained true, :outcome "Committed", :left true}`) and
+          # `Suppressing pre-vote: local role is Leaving` appears zero times
+          # across all six node logs, where the wedge had 721 on one node.
+          #
+          # `key_count` is back at the default 5 for the same reason: at 25 the
+          # run committed almost nothing. An earlier attempt at 3 partitions
+          # backfired the same way (compaction passes 20 -> 6, ok-count
+          # 928 -> 331), because at RF 1 a kill removes a third of the key space
+          # instead of an eighth with no replica to fail over to.
+          #
+          # `placement_evidence: move,purge` drops `seeding` from this job's
+          # vacuity gate, and only from this job's. A snapshot beats log replay
+          # only when the learner starts below the WAL compaction floor, which
+          # needs the floor to have moved, which needs a write volume RF 1 does
+          # not reach: 20 compaction passes here against 928 and 1188 in the
+          # RF-3 jobs. Demanding evidence a configuration cannot produce makes
+          # the gate a permanent red rather than a signal.
+          #
+          # This is a deliberate narrowing of what the job claims, so it is
+          # worth being explicit about what still covers seeding: six RF-3 jobs,
+          # importing 2-7 partitions each on the last green run. If those ever
+          # stop reporting `imported > 0`, that is the alarm this job is no
+          # longer able to raise.
+          #
+          # `move` and `purge` are what RF 1 is actually here for. With one
+          # replica per range a botched move is data loss rather than
+          # degradation, and `purge` catches an un-host that ran too early --
+          # neither of which needs a snapshot to be worth testing.
           - workload: register
             faults: kill,placement
             nodes: n1,n2,n3,n4,n5,n6
             concurrency: 9
             ops_per_key: 40
-            key_count: 25
             kill_targets: one
             time_limit: 600
             partitions: 8
             replication_factor: 1
+            placement_nodes_out: none
+            placement_evidence: move,purge
             force_compaction: true
           # Scale-down: walk the roster from six nodes toward the replication
           # factor and back. The planner must degrade toward fuller replication
@@ -543,17 +571,19 @@ jobs:
         # nemesis *blocks* on the leave call, and one decommission at the
         # default would eat a quarter of a 900 s run.
         #
+        # --require-placement-evidence is rendered only when a job sets it, so
+        # every other job keeps the checker's own default byte for byte. It
+        # narrows what a job claims, which is not something to apply broadly by
+        # accident.
+        #
         # --force-compaction and --key-range are the two exceptions: both are
         # switches, so they are present or absent rather than carrying a value.
         # --key-range is the one flag here that changes what the cluster *does*
         # rather than only what the harness does -- it registers the workload's
         # key space for key-order routing before any client starts.
         #
-        # --placement-nodes-out: no job sets `none` today (the RF-1 job that did
-        # has its decommission back), but the rendering below stays as it is
-        # rather than reverting to `x || 1`, because the trap it defuses is
-        # silent. It renders the whole flag rather than just its value, and
-        # spells zero `none`, because `x || 1` cannot express zero
+        # --placement-nodes-out renders the whole flag rather than just its
+        # value, and spells zero `none`, because `x || 1` cannot express zero
         # here: GitHub casts both sides of a comparison to a number, so 0 is
         # falsy *and* `0 == null` is true. Either spelling of zero silently
         # becomes 1, which would put the decommission back into the one job
@@ -580,6 +610,7 @@ jobs:
             --replication-factor ${{ matrix.replication_factor || 0 }} \
             --placement-interval ${{ matrix.placement_interval || 30 }} \
             ${{ matrix.placement_nodes_out == 'none' && '--placement-nodes-out 0' || format('--placement-nodes-out {0}', matrix.placement_nodes_out || 1) }} \
+            ${{ matrix.placement_evidence && format('--require-placement-evidence {0}', matrix.placement_evidence) || '' }} \
             --decommission-drain-timeout ${{ matrix.decommission_drain_timeout || 60000 }} \
             --range-interval ${{ matrix.range_interval || 20 }} \
             ${{ matrix.force_compaction && '--force-compaction' || '' }} \

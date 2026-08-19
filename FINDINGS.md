@@ -209,9 +209,11 @@ from-nothing rebuild at RF 1: `set-rf` raises the factor on a *live* partition w
 so the new learner backfills from the log and no whole-partition snapshot is ever sent. The vacuity
 gate is asking this job for evidence its new shape does not naturally produce.
 
-**Resolved: the decommission is back, and the partition count came down with it.** Of the three
-options — scope the gate down, restore the decommission, or leave the job red — the second is the
-only one that recovers what was lost rather than agreeing to stop looking for it.
+**Resolved, after two wrong turns: the decommission is out again.** The decision below (restore the
+decommission, then cut partitions, then raise `key_count`) was reversed once three runs had measured
+what it costs. Read this section as a record of the reasoning, not as current configuration — the
+job now runs `placement_nodes_out: none`, `key_count: 5`, `partitions: 8`, and the measurements that
+settled it are at the end.
 
 **But the decommission alone would not have fixed the missing seeding, and it is worth being exact
 about why.** A snapshot beats log replay only when the learner starts *below* the WAL compaction
@@ -253,7 +255,50 @@ is enough to lift the floor far enough for a learner to start below it is still 
 and the honest fallback if it is not is to scope this job's evidence to `move,purge` and let the six
 RF-3 jobs carry the seeding coverage.
 
-### What the run did settle: the RF-1 drain works
+### And then the decommission itself turned out to be the problem
+
+Three runs of the same job, one variable at a time:
+
+| Config | recovery windows | recovered | ok-count |
+|---|---|---|---|
+| 8 partitions, 5 keys, **no decommission** | 20 | yes (median 104 ms) | **928** |
+| 3 partitions, 5 keys, decommission | 3 | 0 of 3 | 331 |
+| 8 partitions, **25 keys**, decommission | 5 | 0 of 5 | **3** |
+
+The last run committed **3 successful operations out of 5338** and failed the `cas` starvation gate,
+not the seeding gate. The collapse tracks the decommission, not the tuning either side of it: a
+drain blocks the placement nemesis for up to the 60 s timeout, and — since the Kommander
+learner-promotion fix landed — placement now *genuinely moves replicas*, which at RF 1 takes a range
+offline with no second copy to serve it.
+
+**The Kommander fix working is why this job stopped working.** Its fault budget was calibrated when
+the rebalancer was a no-op, and nobody re-derived it afterwards. That is worth remembering the next
+time a server fix lands under a job whose faults were tuned against the broken behaviour.
+
+Reverted to `placement_nodes_out: none`, `key_count: 5`, `partitions: 8` — the configuration that
+produced 928 ok-count and 20 healthy recovery windows.
+
+That configuration reports `:missing [:seeding]`, so **the job's gate is now scoped to
+`move,purge`** — `--require-placement-evidence`, rendered only for jobs that set it, so every other
+job keeps the checker's default byte for byte.
+
+Loosening a vacuity gate is the move this suite has been burned by before, so the reasoning is
+recorded rather than assumed. RF 1 managed 20 compaction passes against 928 and 1188 in the RF-3
+jobs; a snapshot only beats log replay when the learner starts below the WAL compaction floor, so
+this profile cannot produce seeding evidence at any write volume it can sustain. A gate demanding it
+is a permanent red, not a signal. What still covers seeding: six RF-3 jobs, importing 2–7 partitions
+each on the last green run — **if those ever stop reporting `imported > 0`, that is the alarm this
+job can no longer raise.**
+
+`move` and `purge` are what RF 1 is actually for: with one replica per range a botched move is data
+loss rather than degradation, and `purge` catches an un-host that ran too early. Neither needs a
+snapshot to be worth testing.
+
+Two checker tests guard the narrowing from becoming a way to buy a green — that a configured set is
+honoured exactly (a dropped kind must not creep back, an asked-for kind must not vanish), and that
+naming a kind the harness cannot read returns `:unmeasured` rather than a pass.
+
+### What the decommission did settle before it went: the RF-1 drain works
 
 `{:drained true, :outcome "Committed", :left true}` — an RF-1 decommission committed with no timeout
 at all, and `Suppressing pre-vote: local role is Leaving` appears **zero** times across all six node
@@ -481,6 +526,25 @@ merge copies through the destination's log too and refuses a contended page the 
 
 `kahuna.checker.range` is unchanged: a retryable refusal still lands in `:indeterminate`. Counting
 it separately is still worth doing, but it is cosmetic next to the nemesis no longer giving up.
+
+**Confirmed working on run `32209182751`**, and the retry demonstrably fired rather than the job
+merely getting luckier:
+
+| `register / partition,kill,placement,range` | before | after |
+|---|---|---|
+| `:attempted` | 11 | 7 |
+| `:succeeded` | **0** | **1** (destination partition 13) |
+| `TransferFailed` | 8 | 4 |
+| verdict | `:unknown, :missing [:split]` | **pass** |
+
+Ten `range: retrying after TransferFailed` lines in that job's log, and operations carrying
+`:retries [["n5" "TransferFailed"]]` in the history — so the retry path executed, and the gap
+between ten retries and four final `TransferFailed` outcomes is the safety check declining to
+reissue against a map that had moved. Both halves of the design are live, not theoretical.
+
+One split is a thin margin. `TransferFailed` has not gone away, and a run that clears the gate by a
+single success is one bad interleaving from failing it again — the retry buys attempts, not
+immunity.
 
 The `:no-split-key 11` skips are unrelated and expected: `register` runs 5 keys by default, so the
 key space runs out of bisection points quickly. They are skips, not failures, and they are why 22
