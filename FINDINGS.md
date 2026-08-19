@@ -278,6 +278,39 @@ time a server fix lands under a job whose faults were tuned against the broken b
 Reverted to `placement_nodes_out: none`, `key_count: 5`, `partitions: 8` — the configuration that
 produced 928 ok-count and 20 healthy recovery windows.
 
+### …and 928 was never a baseline. The job is bistable.
+
+The revert did not restore it. Run `32211997573` ran that exact configuration and committed **6
+operations**, with 0 of 20 recovery windows recovered.
+
+The obvious reading was a server regression, and it is wrong. Kahuna's newest commit at that point,
+`70b75d2`, is dated 2026-08-19T00:11; the four runs were dispatched at 01:08, 01:47, 02:37 and
+03:24. **No server commit landed between the 928-op run and the 6-op run**, and the only matrix
+difference was `--require-placement-evidence`, which is checker-only. Same build, same faults, same
+40 kills.
+
+| | run `32203864431` | run `32211997573` |
+|---|---|---|
+| `replicas-gained` / `partitions-moved` | 7 / 4 | 3 / 2 |
+| recovery windows recovered | 20 of 20 | **0 of 20** |
+| ok-count | 928 | **6** |
+
+The difference tracks how many repairs completed, which is a feedback loop rather than a defect. At
+RF 1 a killed node's ranges are dead until rebuilt; a rebuild is add-learner → seed → promote →
+retire; kills arrive every 15 s at the default `--nemesis-interval`. Fall behind early and more
+ranges stay dead, throughput drops, repairs slow further, and the run never returns. Keep up and it
+stays healthy for 600 s. Two stable states, decided in the first minute. At RF 3 it never surfaces
+because surviving replicas serve straight through the gap.
+
+**So 928 was one sample of a bimodal job, and three rounds of tuning were built on it** — including
+the partition-count and `key_count` changes above, which were measured against a number that was
+not reproducible. That is the lesson worth keeping: this suite establishes baselines from single
+runs routinely, and for a marginal profile that is not enough.
+
+Fixed by giving repairs room: `nemesis_interval: 45` on that job only. The job exists to prove the
+planner can rebuild a range from nothing, and that requires the workload to survive long enough to
+*observe* the rebuild.
+
 That configuration reports `:missing [:seeding]`, so **the job's gate is now scoped to
 `move,purge`** — `--require-placement-evidence`, rendered only for jobs that set it, so every other
 job keeps the checker's default byte for byte.

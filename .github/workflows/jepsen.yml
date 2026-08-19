@@ -246,58 +246,48 @@ jobs:
           # profile where a repair is unavoidable -- kill the node holding a
           # range and the planner has to rebuild it somewhere else from nothing.
           #
-          # The decommission is deliberately kept here, after a round trip that
-          # is worth recording. It was dropped on 2026-08-18 (via
-          # `placement_nodes_out: none`) because Kommander documents RF-1
-          # decommission as unsupported -- `b2e2ee03`: a range with one voter
-          # has nowhere to hand off, so the drain works only while the leaver
-          # keeps that range's leadership -- and run 32175423183 had shown the
-          # drain timing out, the node stuck at `Leaving`, and its range never
-          # electing a leader again.
+          # This job has been retuned four times in a day, so the reasoning is
+          # written out rather than left in the diff.
           #
-          # Dropping it cost more than it saved. Run 32203864431 was the only
-          # job in the matrix to report `:cause :vacuous, :missing [:seeding]`:
-          # `set-rf` raises the factor on a *live* partition whose WAL is
-          # intact, so the new learner backfills from the log and no
-          # whole-partition snapshot is ever sent. The decommission was the only
-          # thing at RF 1 forcing a rebuild from nothing -- which is precisely
-          # the property this job exists to test, since at RF 1 a bad seed is
-          # data loss rather than degradation.
+          # `nemesis_interval: 45` (default 15) is the load-bearing one, and it
+          # exists because the job turned out to be **bistable**, not because
+          # anything regressed. Two runs on the same server build and the same
+          # config landed in opposite states:
           #
-          # So it is back, and it now carries a second purpose: it is the only
-          # `placement_nodes_out: none` drops the decommission and keeps the
-          # replication-factor overrides, which still make the planner add,
-          # seed, promote and retire replicas. It is here because three runs
-          # measured what the decommission costs this profile, and the answer is
-          # the job itself:
+          #   run 32203864431:  7 replicas gained, 4 partitions moved,
+          #                     20/20 recovery windows recovered,  928 ok
+          #   run 32211997573:  3 replicas gained, 2 partitions moved,
+          #                      0/20 recovery windows recovered,    6 ok
           #
-          #   config                              windows  recovered  ok-count
-          #   8 parts, 5 keys, no decommission        20    yes           928
-          #   3 parts, 5 keys, decommission            3    0 of 3        331
-          #   8 parts, 25 keys, decommission           5    0 of 5          3
+          # No Kahuna commit landed between them (70b75d2 predates both), and
+          # the only matrix difference was a checker-only flag. The difference
+          # is a feedback loop: at RF 1 a killed node's ranges are dead until
+          # rebuilt, a rebuild is add-learner -> seed -> promote -> retire, and
+          # a kill every 15 s does not leave room for one. Fall behind early and
+          # more ranges stay dead, throughput drops, repairs slow further, and
+          # the run never comes back. At RF 3 this never surfaces because the
+          # surviving replicas serve straight through it.
           #
-          # The collapse is the decommission, not the tuning either side of it.
-          # A drain blocks the placement nemesis for up to the 60 s timeout, and
-          # -- since the Kommander learner-promotion fix landed -- placement now
-          # genuinely moves replicas, which at RF 1 takes a range offline with
-          # no second copy to serve it. This job's fault budget was calibrated
-          # when the rebalancer was a no-op; it is not survivable now. The last
-          # run committed 3 operations out of 5338 and failed on the `cas`
-          # starvation gate rather than on anything about placement.
+          # So 45 s. The job exists to prove the planner can rebuild a range
+          # from nothing, and that requires the workload to survive long enough
+          # to *observe* the rebuild.
           #
-          # Nothing is lost by dropping it. Kommander documents RF-1
-          # decommission as unsupported, and the one question that justified
+          # `placement_nodes_out: none` drops the decommission. It was dropped
+          # on 2026-08-18, restored, then dropped again -- the restoration is
+          # what produced the 331-op and 3-op runs above. Kommander documents
+          # RF-1 decommission as unsupported (`b2e2ee03`: a range with one voter
+          # has nowhere to hand off), and the one question that justified
           # testing it anyway -- whether a timed-out drain rolls back cleanly --
           # was answered by run 32206164668: the drain **committed**
           # (`{:drained true, :outcome "Committed", :left true}`) and
           # `Suppressing pre-vote: local role is Leaving` appears zero times
           # across all six node logs, where the wedge had 721 on one node.
           #
-          # `key_count` is back at the default 5 for the same reason: at 25 the
-          # run committed almost nothing. An earlier attempt at 3 partitions
-          # backfired the same way (compaction passes 20 -> 6, ok-count
-          # 928 -> 331), because at RF 1 a kill removes a third of the key space
-          # instead of an eighth with no replica to fail over to.
+          # `key_count` stays at the default 5 and `partitions` at 8. Raising
+          # keys to 25 and cutting partitions to 3 were both attempts to buy
+          # seeding evidence; both backfired, because at RF 1 anything that
+          # widens the blast radius of a kill costs write volume rather than
+          # gaining it.
           #
           # `placement_evidence: move,purge` drops `seeding` from this job's
           # vacuity gate, and only from this job's. A snapshot beats log replay
@@ -323,6 +313,7 @@ jobs:
             concurrency: 9
             ops_per_key: 40
             kill_targets: one
+            nemesis_interval: 45
             time_limit: 600
             partitions: 8
             replication_factor: 1
