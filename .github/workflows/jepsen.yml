@@ -289,24 +289,35 @@ jobs:
           # widens the blast radius of a kill costs write volume rather than
           # gaining it.
           #
-          # `placement_evidence: move,purge` drops `seeding` from this job's
-          # vacuity gate, and only from this job's. A snapshot beats log replay
-          # only when the learner starts below the WAL compaction floor, which
-          # needs the floor to have moved, which needs a write volume RF 1 does
-          # not reach: 20 compaction passes here against 928 and 1188 in the
-          # RF-3 jobs. Demanding evidence a configuration cannot produce makes
-          # the gate a permanent red rather than a signal.
+          # `placement_evidence: move` narrows this job's vacuity gate to the one
+          # kind it produces every time, and narrows only this job's. It arrived
+          # at `move` in two steps, both worth recording because each was made
+          # from a single sample and the second one was wrong:
           #
-          # This is a deliberate narrowing of what the job claims, so it is
-          # worth being explicit about what still covers seeding: six RF-3 jobs,
-          # importing 2-7 partitions each on the last green run. If those ever
-          # stop reporting `imported > 0`, that is the alarm this job is no
-          # longer able to raise.
+          #   run 32203864431   move 7   purge ?   seeding 0   -> missing seeding
+          #   run 32211997573   move 3   purge 2   seeding 0
+          #   run 32215919532   move 7   purge 0   seeding 0   -> missing purge
           #
-          # `move` and `purge` are what RF 1 is actually here for. With one
-          # replica per range a botched move is data loss rather than
-          # degradation, and `purge` catches an un-host that ran too early --
-          # neither of which needs a snapshot to be worth testing.
+          # `seeding` went first, and that reasoning holds: a snapshot beats log
+          # replay only when the learner starts below the WAL compaction floor,
+          # which needs a write volume RF 1 does not reach -- 20 compaction
+          # passes here against 928 and 1188 in the RF-3 jobs.
+          #
+          # `purge` went second. It was kept on the strength of one run where it
+          # happened to be 2, and the very next run had `unhosted 0` with seven
+          # replicas gained and none lost: without the decommission, `clear-rf`
+          # does not reliably drive a replica all the way to un-host inside a
+          # run. `move` is the only kind present in all three.
+          #
+          # This is a deliberate narrowing of what the job claims, so be explicit
+          # about what now covers the rest: the six RF-3 placement jobs, which
+          # import 2-7 partitions and purge 32-135 each on a green run. **If
+          # those ever stop reporting `imported > 0` or `unhosted > 0`, that is
+          # the alarm this job can no longer raise.**
+          #
+          # `move` is the property RF 1 is actually here for: a replica
+          # relocating when there is only one copy of the data, where a botched
+          # move is data loss rather than degradation.
           - workload: register
             faults: kill,placement
             nodes: n1,n2,n3,n4,n5,n6
@@ -318,7 +329,7 @@ jobs:
             partitions: 8
             replication_factor: 1
             placement_nodes_out: none
-            placement_evidence: move,purge
+            placement_evidence: move
             force_compaction: true
           # Scale-down: walk the roster from six nodes toward the replication
           # factor and back. The planner must degrade toward fuller replication

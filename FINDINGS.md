@@ -311,21 +311,37 @@ Fixed by giving repairs room: `nemesis_interval: 45` on that job only. The job e
 planner can rebuild a range from nothing, and that requires the workload to survive long enough to
 *observe* the rebuild.
 
-That configuration reports `:missing [:seeding]`, so **the job's gate is now scoped to
-`move,purge`** — `--require-placement-evidence`, rendered only for jobs that set it, so every other
-job keeps the checker's default byte for byte.
+That configuration reports `:missing [:seeding]`, so **the job's gate is now scoped to `move`** —
+`--require-placement-evidence`, rendered only for jobs that set it, so every other job keeps the
+checker's default byte for byte.
+
+It got there in two steps, and the second correction is the instructive one:
+
+| Run | `move` | `purge` | `seeding` | Verdict |
+|---|---|---|---|---|
+| `32203864431` | 7 | — | 0 | `:missing [:seeding]` |
+| `32211997573` | 3 | 2 | 0 | placement passed |
+| `32215919532` (nightly) | 7 | **0** | 0 | **`:missing [:purge]`** |
+
+`seeding` was dropped first, for the reason below. `purge` was **kept** on the strength of the
+single run where it happened to be 2 — and the very next run had `unhosted 0` alongside seven
+replicas gained and none lost. Without the decommission, `clear-rf` does not reliably drive a
+replica all the way to un-host inside a run, so `purge` is as unproducible here as `seeding`.
+
+That is the single-sample error again, made *in the act of writing the warning about it* one section
+below. `move` is the only kind present in all three runs.
 
 Loosening a vacuity gate is the move this suite has been burned by before, so the reasoning is
 recorded rather than assumed. RF 1 managed 20 compaction passes against 928 and 1188 in the RF-3
 jobs; a snapshot only beats log replay when the learner starts below the WAL compaction floor, so
 this profile cannot produce seeding evidence at any write volume it can sustain. A gate demanding it
-is a permanent red, not a signal. What still covers seeding: six RF-3 jobs, importing 2–7 partitions
-each on the last green run — **if those ever stop reporting `imported > 0`, that is the alarm this
-job can no longer raise.**
+is a permanent red, not a signal. What now covers the rest: the six RF-3 placement jobs, which
+import 2–7 partitions and purge 32–135 each on a green run — **if those ever stop reporting
+`imported > 0` or `unhosted > 0`, that is the alarm this job can no longer raise.**
 
-`move` and `purge` are what RF 1 is actually for: with one replica per range a botched move is data
-loss rather than degradation, and `purge` catches an un-host that ran too early. Neither needs a
-snapshot to be worth testing.
+`move` is what RF 1 is actually for: a replica relocating when there is only one copy of the data,
+where a botched move is data loss rather than degradation. It needs no snapshot and no un-host to be
+worth testing, and it is the one kind this job has produced on every run.
 
 Two checker tests guard the narrowing from becoming a way to buy a green — that a configured set is
 honoured exactly (a dropped kind must not creep back, an asked-for kind must not vanish), and that
