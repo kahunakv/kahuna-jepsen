@@ -292,6 +292,33 @@
     (when join?
       [:--join-existing]))))
 
+(def server-env
+  "Environment for the server process.
+
+  `DOTNET_SYSTEM_NET_SOCKETS_INLINE_COMPLETIONS` is a performance knob carried
+  over from the Kahuna repo's own entrypoint.
+
+  The `Logging__Console__*` vars make the .NET console logger stamp every
+  record. Without them `kahuna.log` carries no time at all — the `simple`
+  formatter writes `info: Category[id]` and the message, and nothing else — so
+  a server event cannot be lined up against a Jepsen operation. Findings from
+  this suite then stay circumstantial no matter how good the history is: see
+  the kahuna feature `89b6d6a3`, where two stability violations could not be
+  matched to the leadership changes that most likely caused them.
+
+  `WebApplication.CreateBuilder` binds these under
+  `Logging:Console:FormatterOptions`, and it adds environment variables to
+  configuration *after* `appsettings.json`, so they win over the file.
+
+  UTC rather than local time. The store directory name and the CI runner are
+  both UTC, and the trailing `Z` states it on every line instead of leaving a
+  reader to infer it. A local run in another zone will differ from
+  `jepsen.log`'s wall clock by that offset."
+  {:DOTNET_SYSTEM_NET_SOCKETS_INLINE_COMPLETIONS 1
+   :Logging__Console__FormatterName "simple"
+   :Logging__Console__FormatterOptions__TimestampFormat "yyyy-MM-dd'T'HH:mm:ss.fff'Z' "
+   :Logging__Console__FormatterOptions__UseUtcTimestamp "true"})
+
 (defn start!
   ([test node] (start! test node false))
   ([test node join?]
@@ -300,7 +327,7 @@
        {:chdir   dir
         :logfile logfile
         :pidfile pidfile
-        :env     {:DOTNET_SYSTEM_NET_SOCKETS_INLINE_COMPLETIONS 1}}
+        :env     server-env}
        binary
        (start-args test node join?)))))
 

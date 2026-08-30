@@ -500,9 +500,13 @@ partition, so the requirement is only that the threshold fire early, not that it
 divided by however many Raft groups the traffic is spread across, and `--partitions 8` is part of
 this profile. Calibrating one against a cluster-wide op count will always be wrong by that factor.
 
-## Open: range splits fail their bulk copy under replica placement
+## Open: a split's bulk copy fails repeatably, with nothing moving and the network whole
 
-Filed as `a0e95736` to be investigated, **not** as an established defect. From run `32049527245`:
+Filed as `a0e95736` to be investigated, **not** as an established defect. The spec was rewritten on
+2026-08-19 and the section below is chronological: the original claim first, then the retry fix,
+then the narrowing that replaced it. Start at "Version 2 of the spec" for the current state.
+
+Version 1, from run `32049527245`:
 
 | Job | RF | Placement active | Split outcomes |
 |---|---|---|---|
@@ -598,6 +602,46 @@ immunity.
 The `:no-split-key 11` skips are unrelated and expected: `register` runs 5 keys by default, so the
 key space runs out of bisection points quickly. They are skips, not failures, and they are why 22
 ops yielded only 11 attempts.
+
+### Version 2 of the spec: the original claim no longer reproduces (run `32259737977`)
+
+`a0e95736` was rewritten on 2026-08-19. The headline — 10 `TransferFailed` against 2 `Succeeded` at
+RF 3 — does not survive:
+
+| Job | RF | Run `32049527245` | Run `32259737977` |
+|---|---|---|---|
+| `register / partition,kill,range` | 0 | 6 Succeeded | 6 Succeeded |
+| `append / range` | 0 | not in the matrix yet | **16 Succeeded** |
+| `register / partition,kill,placement,range` | 3 | 1 Succeeded, **5 TransferFailed** | **4 Succeeded**, 1 TransferFailed, 1 Indeterminate |
+| `append / partition,placement,range` | 3 | 0 Succeeded, **5 TransferFailed** | **1 Succeeded**, 3 Indeterminate |
+
+**Read the counts carefully, because two things moved under them.** `cfbb55d2` redefined what
+`TransferFailed` covers, and the retry above completes some splits that would otherwise have landed
+in this column. These are "splits the harness could not finish in three tries", not "copy failures
+per attempt".
+
+**All four `Indeterminate` outcomes are the `partition` fault, not the copy.** Each carries a gRPC
+transport error in `:reason` — HTTP/2 `KeepAlivePingDelay` ping timeouts on the `append` job, an
+`HttpIOException: The response ended prematurely` on the `register` job — and the range map is
+identical before and after in every one. Excluding them shrinks the RF 3 versus RF 0 contrast to one
+copy failure in ten attempts against none in twenty-two.
+
+**What is left is one failure, and it is a better one than any of the original ten.** The surviving
+`TransferFailed` exhausted all three attempts on `n5`, against the whole-space descriptor
+`[nil nil 4]`, with `:ranges-before` equal to `:ranges-after` on every attempt. The window at
+13:49:02–13:49:09 is unusually clean: the network was healed eight seconds earlier
+(`:stop-partition :network-healed` at 13:48:54), the next placement operation (`decommission n5`)
+started at 13:49:09.161 — *after* the third attempt returned at 13:49:09.149 — and `n3` was the only
+node down. The same job then split successfully four times later in the run.
+
+So the question narrowed. It is no longer "does placement break the copy". It is "why does one copy
+fail repeatably with nothing moving and the network whole". The cheapest way to answer it is
+server-side: `"Copying the upper half to the destination partition failed"` is one status for
+several conditions, which is the same conflation `8ecae568` untangled for `PartitionCreationFailed`.
+
+**One harness follow-up is recorded on the spec and not yet done:** the retry set is
+`#{"TransferFailed"}` only, but an `Indeterminate` from a transport error leaves the map provably
+unchanged too, so the same safety gate would license retrying it.
 
 ## Open: fencing tokens go backwards and get reused under replica placement
 

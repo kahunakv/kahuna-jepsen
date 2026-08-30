@@ -624,7 +624,12 @@ jobs:
         run: |
           mkdir -p store/docker-logs
           for n in ${NODES//,/ }; do
-            docker logs "jepsen-$n" > "store/docker-logs/$n.docker.log" 2>&1 || true
+            # -t stamps each line with an RFC3339 time. These are the container's
+            # own stdout (sshd), not the Kahuna server -- the server writes to
+            # /opt/kahuna/kahuna.log, collected separately as n*/kahuna.log -- but a
+            # container log with no time is no more alignable than a server log with
+            # none was.
+            docker logs -t "jepsen-$n" > "store/docker-logs/$n.docker.log" 2>&1 || true
           done
 
       - name: Upload Jepsen store
