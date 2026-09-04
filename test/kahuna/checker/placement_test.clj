@@ -315,11 +315,14 @@
 ;; Narrowing the gate for a profile that cannot produce every kind
 ;; ---------------------------------------------------------------------------
 ;;
-;; The RF-1 job runs `--require-placement-evidence move,purge`, dropping
-;; `seeding`. A snapshot seed only beats log replay when the learner starts
-;; below the WAL compaction floor, and RF 1 never writes enough to move that
-;; floor -- 20 compaction passes against 928 and 1188 in the RF-3 jobs -- so
-;; demanding it there makes the gate a permanent red rather than a signal.
+;; The RF-1 job runs `--require-placement-evidence transfer`, dropping
+;; `seeding`, `purge` and finally `move`. A snapshot seed only beats log replay
+;; when the learner starts below the WAL compaction floor, and RF 1 never writes
+;; enough to move that floor -- 20 compaction passes against 928 and 1188 in the
+;; RF-3 jobs -- so demanding it there makes the gate a permanent red rather than
+;; a signal. `move` went the same way for a different reason: that job has
+;; produced runs where the planner added Learners and promoted none, so a
+;; completed move is not something it can be asked to show every night.
 ;;
 ;; Narrowing a vacuity gate is the move this suite has been burned by before, so
 ;; the two properties worth pinning are both about it *not* becoming a way to
@@ -350,3 +353,35 @@
     (is (= :unknown (:valid? r)))
     (is (= :unmeasured (:cause r)))
     (is (= [:purge] (:unmeasured r)))))
+
+(deftest requiring-transfer-accepts-a-move-that-only-started
+  ;; The weakest requirement in the set, and the one the RF-1 job runs. This is
+  ;; the exact history that `move` refuses -- a Learner appeared and the voter
+  ;; set never changed -- so the two requirements must disagree about it, or
+  ;; `transfer` is not doing anything `move` was not already doing.
+  (let [r (check* (assoc base-test :require-placement-evidence #{:transfer})
+                  [(sample 0 steady) (sample 1000 moving)])]
+    (is (true? (:valid? r)))
+    (is (= [:transfer] (:evidence-required r)))
+    (is (= 1 (get-in r [:evidence :transfer :count])))
+    (is (= 0 (get-in r [:evidence :move :count])))))
+
+(deftest requiring-transfer-still-refuses-a-run-that-attempted-nothing
+  ;; The accepting twin's refusal, and the property that makes the narrowing
+  ;; safe to ship: `transfer` must not be a way to buy a green from an idle
+  ;; nemesis. No transitional replica was ever sampled here, so the gate has to
+  ;; hold even at its weakest setting.
+  (let [r (check* (assoc base-test :require-placement-evidence #{:transfer})
+                  [(sample 0 steady) (sample 1000 steady)])]
+    (is (= :unknown (:valid? r)))
+    (is (= :vacuous (:cause r)))
+    (is (= [:transfer] (:missing r)))))
+
+(deftest transfer-is-unmeasurable-without-samples
+  ;; Same distinction `:move` draws, and it matters more here: `transfer` is
+  ;; read from the samples alone, so an absent sampler must report :unmeasured
+  ;; rather than let a zero stand for "the planner attempted nothing".
+  (let [r (check* (assoc base-test :require-placement-evidence #{:transfer}) [])]
+    (is (= :unknown (:valid? r)))
+    (is (= :unmeasured (:cause r)))
+    (is (= [:transfer] (:unmeasured r)))))

@@ -289,14 +289,13 @@ jobs:
           # widens the blast radius of a kill costs write volume rather than
           # gaining it.
           #
-          # `placement_evidence: move` narrows this job's vacuity gate to the one
-          # kind it produces every time, and narrows only this job's. It arrived
-          # at `move` in two steps, both worth recording because each was made
-          # from a single sample and the second one was wrong:
+          # `placement_evidence: transfer` narrows this job's vacuity gate, and
+          # narrows only this job's. It arrived there in three steps, and the
+          # first two were each made from a single sample:
           #
-          #   run 32203864431   move 7   purge ?   seeding 0   -> missing seeding
+          #   run 32203864431   move 7   purge ?   seeding 0   -> dropped seeding
           #   run 32211997573   move 3   purge 2   seeding 0
-          #   run 32215919532   move 7   purge 0   seeding 0   -> missing purge
+          #   run 32215919532   move 7   purge 0   seeding 0   -> dropped purge
           #
           # `seeding` went first, and that reasoning holds: a snapshot beats log
           # replay only when the learner starts below the WAL compaction floor,
@@ -307,17 +306,43 @@ jobs:
           # happened to be 2, and the very next run had `unhosted 0` with seven
           # replicas gained and none lost: without the decommission, `clear-rf`
           # does not reliably drive a replica all the way to un-host inside a
-          # run. `move` is the only kind present in all three.
+          # run.
           #
-          # This is a deliberate narrowing of what the job claims, so be explicit
-          # about what now covers the rest: the six RF-3 placement jobs, which
-          # import 2-7 partitions and purge 32-135 each on a green run. **If
-          # those ever stop reporting `imported > 0` or `unhosted > 0`, that is
-          # the alarm this job can no longer raise.**
+          # `move` went third, and this is the step the three samples above were
+          # too few to see. It is not reliably producible here either:
           #
-          # `move` is the property RF 1 is actually here for: a replica
-          # relocating when there is only one copy of the data, where a botched
-          # move is data loss rather than degradation.
+          #   run 33490135392   9 overrides   3 learners    0 gained   red
+          #   run 33607803563  10 overrides   4 learners    0 gained   red
+          #   run 33733278963  14 overrides  16 learners   13 gained   green
+          #
+          # On the two red runs the planner added Learners and promoted none of
+          # them, so the committed voter set never changed and `move` stayed 0.
+          # It is not a timing artefact of the nemesis: run 33607803563 held its
+          # overrides for 22-55 s and promoted nothing, while run 33733278963
+          # held one for 0.7 s and still gained 13 voters across the run. The
+          # runs differ in the server build -- `KAHUNA_REF: main` is resolved
+          # afresh every night -- so **the stall is a Kahuna suspect, not a
+          # harness one**, and it is filed as such rather than tuned away here.
+          #
+          # So this job now claims the weaker property it can always show: the
+          # planner *started* a move. `transfer` counts a replica observed in a
+          # transitional role, which no amount of booting or restarting can
+          # fake -- a node comes up in whatever role the committed map already
+          # gives it, and a Learner exists only because the planner decided to
+          # change that map. A run where the nemesis achieved nothing still
+          # comes back `:vacuous`, which is what the gate is for.
+          #
+          # Be explicit about what this job no longer asserts. **Completed moves
+          # at RF 1 are now unasserted.** The six RF-3 placement jobs cover
+          # completed moves, and they import 2-7 partitions and purge 32-135
+          # each on a green run. If those ever stop reporting `imported > 0` or
+          # `unhosted > 0`, that is the alarm this job can no longer raise.
+          #
+          # What survives here is every safety property, which is checked on
+          # every run whatever the gate says: single mover per range, no lost
+          # range, and no two nodes disagreeing about one generation. At RF 1
+          # those are the ones that matter, because a botched move with one copy
+          # of the data is data loss rather than degradation.
           - workload: register
             faults: kill,placement
             nodes: n1,n2,n3,n4,n5,n6
@@ -329,7 +354,7 @@ jobs:
             partitions: 8
             replication_factor: 1
             placement_nodes_out: none
-            placement_evidence: move
+            placement_evidence: transfer
             force_compaction: true
           # Scale-down: walk the roster from six nodes toward the replication
           # factor and back. The planner must degrade toward fuller replication

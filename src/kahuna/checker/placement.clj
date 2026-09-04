@@ -25,10 +25,20 @@
 
   | evidence | where it comes from |
   |---|---|
+  | `transfer` | the sampled placement tables: a replica was seen mid-move, as a Learner or a Removing |
   | `move` | the sampled placement tables: a partition's committed replica set changed |
   | `seeding` | `Imported whole-partition state of partition #N` in a node log |
   | `purge` | `Stopped hosting N partition(s)` in a node log |
   | `split` | `RangeSplitTrigger: split` in a node log |
+
+  `transfer` is the weakest of these and exists for one profile only. It says
+  the planner *started* a move, not that one finished, so it is the honest
+  requirement for a configuration where a completed move is not reliably
+  producible — see `default-required-evidence` and the RF-1 job in
+  `.github/workflows/jepsen.yml`. It is not satisfied by starting the cluster: a
+  node boots into whatever role the committed map already gives it, and a
+  Learner or a Removing exists only because the planner decided to change that
+  map.
 
   Node logs are downloaded before the checker runs (jepsen captures them in step
   6 and checks in step 9), so reading them here is sound. When they are missing
@@ -426,8 +436,11 @@
 
 (def evidence-kinds
   "The kinds of placement activity a run can be required to demonstrate, in the
-  order they are reported."
-  [:move :seeding :purge :split])
+  order they are reported.
+
+  Ordered weakest first: a `transfer` is the start of a `move`, and the rest are
+  the work a move causes."
+  [:transfer :move :seeding :purge :split])
 
 (def replica-moving-faults
   "Faults that can change the committed placement map, and so can be asked to
@@ -468,7 +481,13 @@
   split needs a key space registered for key-range routing, which is what
   `--key-range` does and what `kahuna.checker.range` gates on. Requiring it of
   every replication-factor run would fail runs that never asked to be
-  range-routed."
+  range-routed.
+
+  `:transfer` is absent because `:move` already implies it and is the stronger
+  claim: a committed replica set does not change without a replica passing
+  through a transitional role first. Requiring both would add nothing to a
+  default run. It is here for the job that must ask for the weaker one
+  *instead*."
   #{:move :seeding :purge})
 
 (defn evidence
@@ -478,7 +497,8 @@
   it would have been read from are absent — and is never treated as zero."
   [samples logs]
   (let [t (:totals logs)
-        m (movement samples)]
+        m (movement samples)
+        r (roles-observed samples)]
     ;; `:move` comes from the samples alone, never from the logs, and the
     ;; tempting shortcut is worth naming: `Started hosting` looks like a move
     ;; signal and is not. It fires whenever a node's hosted set grows against
@@ -488,7 +508,18 @@
     ;; exact failure mode this checker exists to prevent. `Stopped hosting` has
     ;; no such twin: it fires only when the committed map drops this node as a
     ;; replica, and it schedules the purge on the next line.
-    {:move    (if (seq samples)
+    ;;
+    ;; `:transfer` comes from the same samples and counts the transitional
+    ;; roles, so it is subject to the same blind spot `roles-observed` names: a
+    ;; sampler slower than the promotion window sees the move only after the
+    ;; fact. That makes a zero here weaker than a zero in `:move` — it can mean
+    ;; "sampled too slowly" as well as "nothing was attempted" — which is why
+    ;; this is the requirement of last resort and never a default.
+    {:transfer (if (seq samples)
+                 {:measured? true
+                  :count (+ (:learners r 0) (:removings r 0))}
+                 {:measured? false})
+     :move    (if (seq samples)
                 {:measured? true
                  :count (+ (:replicas-gained m) (:replicas-lost m))}
                 {:measured? false})

@@ -445,8 +445,9 @@
 
    [nil "--require-placement-evidence KINDS" "Comma-separated placement activity
                                              a run must demonstrate before its
-                                             pass counts: move, seeding, purge,
-                                             split (or 'none'). A run that
+                                             pass counts: transfer, move,
+                                             seeding, purge, split (or 'none').
+                                             A run that
                                              triggered none of the machinery
                                              under test is a vacuous pass, so
                                              the checker returns :unknown rather
@@ -459,7 +460,12 @@
                                              default: it needs --key-range, and
                                              is gated by --require-range-evidence
                                              instead, which measures it from the
-                                             range map rather than a log line."
+                                             range map rather than a log line.
+                                             'transfer' is not a default either:
+                                             it asks only that a move *started*,
+                                             and is for a profile where a
+                                             completed move is not reliably
+                                             producible."
     :default placement-checker/default-required-evidence
     :parse-fn parse-evidence
     :validate [#(every? (set placement-checker/evidence-kinds) %)
