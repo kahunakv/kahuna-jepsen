@@ -263,7 +263,10 @@
      :--wal-storage      :rocksdb
      :--wal-path         wal-dir
      :--wal-revision     :v3
-     :--raft-allow-insecure-certificate-validation]
+     :--raft-allow-insecure-certificate-validation
+     ;; The server skips --http-ports when --https-certificate is set, unless
+     ;; this opt-in is given. The client talks cleartext HTTP to kc/http-port.
+     :--allow-plaintext-listener]
     ;; Durability knob: with --disable-wal-sync-writes a node that is SIGKILLed
     ;; may lose acknowledged writes, which is a legitimate finding only if you
     ;; are testing that configuration on purpose. Default here is to fsync.
