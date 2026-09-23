@@ -96,6 +96,25 @@ jobs:
             faults: partition,kill
             concurrency: 5
             ops_per_key: 60
+          # Reads under a Shared point range lock held to commit -- the read
+          # side of strict two-phase locking, and what CamusDB's serializable
+          # transactions do for every row they read. The append jobs above
+          # never acquire a range lock, so the range-lock handler's Shared
+          # mode was unreachable from this matrix; that is how Kahuna
+          # `b4823b8` (a reader granted its lock between a writer's commit-time
+          # probe and its decision, then a G2 cycle) was found by Elle in
+          # CamusDB and not here. The window is a server-internal race, so no
+          # fault is needed to open it; what is needed is contention on few
+          # keys, hence 8 keys and 8 clients, the shape of CamusDB's
+          # `append-rw-8keys`. `partition` is kept so the wait-die path is
+          # exercised under lost acks as well as under contention.
+          - workload: append
+            faults: partition
+            concurrency: 8
+            concurrency_per_key: 4
+            ops_per_key: 60
+            key_count: 8
+            read_lock: shared
           # Every client hammers ONE sequence, so ops-per-key/concurrency-per-key
           # are inert here — the workload does not use jepsen.independent. They
           # are still passed because the run step always renders them.
@@ -642,6 +661,7 @@ jobs:
             --range-interval ${{ matrix.range_interval || 20 }} \
             ${{ matrix.force_compaction && '--force-compaction' || '' }} \
             ${{ matrix.key_range && '--key-range' || '' }} \
+            ${{ matrix.read_lock && format('--read-lock {0}', matrix.read_lock) || '' }} \
             --tarball target/kahuna.tar.gz
 
       - name: Collect server logs

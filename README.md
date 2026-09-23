@@ -70,6 +70,7 @@ reach for:
 | `--faults` | comma-separated `partition,kill,pause,membership,placement,range,clock`, `all`, or `none` for a fault-free control run |
 | `--replication-factor` | voter replicas per range. 0 (default) is full replication and changes nothing; 3 is the standard placed profile, 1 the highest-signal cheap one |
 | `--key-range` | route the workload's key space by key order instead of by hash, so ranges exist to be split. Off by default and inert for `lock` and `sequencer` |
+| `--read-lock` | `append` only. `shared` takes a Shared point range lock before every read and holds it to commit, as CamusDB's serializable transactions do; `none` (default) reads bare. The only path through the range-lock handler this suite has — see the `append` namespace docstring for the G2 window it exists to keep closed |
 | `--kill-targets` | what `kill` aims at: `one,minority,majority,all`. Drop `all` for the `snapshot` workload — a full-cluster kill destroys every live snapshot hold, so the run re-acquires instead of measuring |
 | `--concurrency` | total client threads; **must** be an exact multiple of `--concurrency-per-key` |
 | `--rate` | requests/sec per client |

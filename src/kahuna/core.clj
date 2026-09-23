@@ -611,6 +611,15 @@
     :parse-fn keyword
     :validate [#{:pessimistic :optimistic} "must be pessimistic or optimistic"]]
 
+   [nil "--read-lock MODE" "Lock taken before every read in the append
+                          workload: none (default), or shared for a Shared
+                          point range lock held to commit — what CamusDB's
+                          serializable transactions do, and the only path
+                          through the range-lock handler this suite has."
+    :default :none
+    :parse-fn keyword
+    :validate [#{:none :shared} "must be none or shared"]]
+
    [nil "--key-count COUNT" "Keys in play at once (append workload)"
     :default 5
     :parse-fn read-string]
