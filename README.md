@@ -108,6 +108,7 @@ lein run test --workload register \
 | `--faults …,placement` | the fault that moves replicas. `partition`, `kill` and `pause` never do |
 | `--placement-nodes-out 3` | walks the roster down toward the replication factor and back, instead of one leave/rejoin at a time |
 | `--placement-nodes-out 0` | the other end: never touch the roster, work the replication-factor overrides only. Still drives add, seed, promote and retire — what it drops is the decommission, which Kommander does not support at RF 1 |
+| `--placement-warmup 60` | seconds of writes before the first placement op. The decommission drains a voter of the partition the workload writes (found through `/v1/cluster/routing` and the hash rule in `kahuna.hash`), and a learner joining that partition seeds by snapshot only after its WAL has compacted. Zero puts the first drain in the same millisecond as the first write, which is how two nightlies produced `:missing [:seeding]`; anything under the ~30 s checkpoint cadence still backfills the learner from an untrimmed log |
 
 The run's verdict gains a `:placement` key. It can return `:valid? :unknown` —
 read that as "this run proved nothing", never as a pass:

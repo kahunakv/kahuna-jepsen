@@ -133,6 +133,7 @@
                       ;; exactly as it was.
                       :replication-factor        (:replication-factor opts 0)
                       :placement-interval        (:placement-interval opts 30)
+                      :placement-warmup          (:placement-warmup opts 60)
                       :placement-nodes-out       (:placement-nodes-out opts 1)
                       :placement-sampling        (get opts :placement-sampling true)
                       :placement-sample-interval (:placement-sample-interval opts 3)
@@ -407,6 +408,23 @@
     :default 30
     :parse-fn read-string
     :validate [pos? "must be positive"]]
+
+   [nil "--placement-warmup SECONDS" "Seconds of workload traffic before the
+                                     first placement-nemesis operation. The
+                                     decommission drains a voter of the
+                                     partition the workload writes, and a
+                                     learner that joins it seeds by snapshot
+                                     only once that partition's WAL has
+                                     compacted — which takes writes, and the
+                                     first checkpoint that lets the WAL compact
+                                     lands about 30 s after they start. Fired
+                                     at zero, the first drain adds a learner to
+                                     an empty log and no seed ever happens; at
+                                     20 s the log is still whole and the
+                                     learner backfills from it."
+    :default 60
+    :parse-fn read-string
+    :validate [(complement neg?) "must be zero or positive"]]
 
    [nil "--placement-nodes-out N" "How many nodes the placement nemesis may hold
                                   out of the roster at once. 1 is leave/rejoin

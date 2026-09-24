@@ -24,7 +24,11 @@
   * `:decommission` / `:recommission` — a node commits its own removal through
     `POST /v1/cluster/leave` and is then stopped and wiped; the planner must
     re-replicate its ranges onto the survivors. Rejoining it fresh makes the
-    planner donate ranges back. This is the path that exercises repair, and with
+    planner donate ranges back. The node drained is a voter of the partition
+    the workload writes when one is eligible (see `decommission-target`), and
+    the first drain waits out `--placement-warmup` so that partition has a
+    compacted WAL by the time a learner joins it — the two conditions a
+    snapshot seed needs. This is the path that exercises repair, and with
     `--placement-nodes-out` above 1 it walks the roster down toward the
     replication factor, where the planner must degrade to fuller replication
     rather than lose ranges.
@@ -77,8 +81,10 @@
             [jepsen [control :as c]
                     [generator :as gen]
                     [nemesis :as n]]
+            [jepsen.util :as util]
             [kahuna.client :as kc]
-            [kahuna.db :as kdb]))
+            [kahuna.db :as kdb]
+            [kahuna.hash :as hash]))
 
 (defmacro ^:private attempt
   "Evaluates `body`, returning `fallback` on any throwable. A nemesis that dies
@@ -138,6 +144,69 @@
                       (= "Active" (:state p))
                       (seq (:replicas p)))))
        (mapv key)))
+
+;; ---------------------------------------------------------------------------
+;; Aiming at the partition the workload writes
+;; ---------------------------------------------------------------------------
+
+(defn written-partitions
+  "The data partitions the workload's writes land on, read from the routing
+  rule the cluster publishes, or nil when that cannot be known.
+
+  Under hash routing a whole key space lands on one partition, so a register
+  or append run writes exactly one of its eight partitions and the other seven
+  never compact. The snapshot-seeding path this suite exists to attack runs
+  only when a learner joins a partition whose WAL *has* compacted, so a
+  decommission that never touches a host of the written partition cannot
+  produce a seed no matter how many replicas it moves. Two nightlies went red
+  on `:missing [:seeding]` for exactly that: the nemesis drew n6, n6, n4, n6, n4
+  while partition 3 sat on n1, n2, n3.
+
+  `/v1/cluster/routing` gives the descriptors of a key-range-routed space
+  outright. For a hash-routed space it gives only the rule, and `kahuna.hash`
+  reproduces it — after checking the rule's identifier, so a server that
+  changes its hash yields *no* answer rather than a wrong one. Returns
+  `{:partitions #{pid …} :via :ranges | :hash}`."
+  [test]
+  (when-let [key-space (:key-space test)]
+    (when-let [routing (some #(kdb/routing % key-space)
+                             (shuffle (vec (:nodes test))))]
+      (let [ranged (->> (:key-spaces routing)
+                        (filter #(= key-space (:key-space %)))
+                        (mapcat :ranges)
+                        (keep :partition-id)
+                        set)]
+        (if (seq ranged)
+          {:partitions ranged :via :ranges}
+          (when-let [pid (hash/hash-partition routing key-space)]
+            {:partitions #{pid} :via :hash}))))))
+
+(defn decommission-target
+  "Which node the next `:decommission` drains.
+
+  A voter of a written partition, when one is eligible: draining it forces the
+  planner to add a learner to the one partition that can seed by snapshot.
+  Learners are not candidates — a replica still catching up is not yet what
+  the drain must re-home — and neither is a node already out. When no written
+  partition is known, or none of its voters is eligible, any eligible node is
+  drawn at random exactly as before, and the reason is recorded so a run can
+  show which case it was in.
+
+  `written` is `(:partitions (written-partitions test))`. Returns
+  `{:node n :reason kw}` plus `:partition` when a written partition chose it."
+  [test placement written out]
+  (let [eligible (vec (remove out (:nodes test)))
+        hosts    (vec (for [pid (sort written)
+                            r   (get-in placement [:partitions pid :replicas])
+                            :when (= :voter (:role r))
+                            :let [node (kdb/endpoint->node test (:endpoint r))]
+                            :when (and node (not (contains? out node)))]
+                        {:node node :partition pid}))]
+    (cond
+      (seq hosts)     (assoc (rand-nth hosts) :reason :written-partition-host)
+      (empty? eligible) nil
+      (seq written)   {:node (rand-nth eligible) :reason :no-eligible-host}
+      :else           {:node (rand-nth eligible) :reason :written-partition-unknown})))
 
 ;; ---------------------------------------------------------------------------
 ;; Operations
@@ -268,15 +337,30 @@
                   (done {:skipped :roster-at-floor :roster roster :floor floor})
 
                   :else
-                  (let [node (rand-nth (vec (remove @out (:nodes test))))
-                        _    (info "placement: decommissioning" node)
-                        res  (act! test node kdb/decommission!)]
-                    ;; Only a committed removal counts. A node that refused to
-                    ;; leave is still a member and is still running, so adding
-                    ;; it to `out` would make the next :recommission restart a
-                    ;; node that never stopped.
-                    (when (:left res) (swap! out conj node))
-                    (done (assoc res :node node :out (sort @out))))))
+                  (let [written (written-partitions test)
+                        target  (decommission-target test
+                                                     (any-placement test)
+                                                     (:partitions written)
+                                                     @out)]
+                    (if-not target
+                      (done {:skipped :no-eligible-node :out (sort @out)})
+                      (let [node (:node target)
+                            _    (info "placement: decommissioning" node
+                                       (name (:reason target))
+                                       (or (:partition target) ""))
+                            res  (act! test node kdb/decommission!)]
+                        ;; Only a committed removal counts. A node that refused
+                        ;; to leave is still a member and is still running, so
+                        ;; adding it to `out` would make the next :recommission
+                        ;; restart a node that never stopped.
+                        (when (:left res) (swap! out conj node))
+                        (done (assoc res
+                                     :node   node
+                                     :target (merge (dissoc target :node)
+                                                    (when written
+                                                      {:written (sort (:partitions written))
+                                                       :via     (:via written)}))
+                                     :out    (sort @out))))))))
 
               :recommission
               (if-let [node (first (sort @out))]
@@ -319,6 +403,37 @@
                   (range n))
           (repeat n {:type :info, :f :recommission}))))))
 
+(defrecord NotBefore [t gen]
+  gen/Generator
+  (op [this test ctx]
+    (when-let [[op gen'] (gen/op gen test ctx)]
+      (if (= :pending op)
+        [op (NotBefore. t gen')]
+        [(assoc op :time (max (:time op) t)) (NotBefore. t gen')])))
+  (update [this test ctx event]
+    (NotBefore. t (gen/update gen test ctx event))))
+
+(defn not-before
+  "Wraps `gen` so nothing it emits is scheduled before `secs` into the run.
+
+  Only the schedule moves: the op is handed back with a later `:time`, and the
+  interpreter sleeps until then. Nothing blocks — the sampler and the other
+  nemeses in the same `gen/any` keep running, which `(gen/sleep secs)` on the
+  nemesis thread would not allow.
+
+  Why the placement fault needs a head start and the others do not: the first
+  decommission used to fire in the same millisecond as the first client write,
+  so a learner added by that drain joined a partition whose log was empty and
+  caught up from it — no snapshot, no `seeding` evidence — and the drain then
+  left the partition over-replicated, so no later drain needed a learner there
+  either. And it is not enough for writes to have merely started: the WAL is
+  trimmed only once a checkpoint has advanced the retention floor, and the
+  first one lands about 30 s after the first write (`--checkpoint-interval`).
+  A 20 s head start was measured to backfill 67 entries from index 1 — no
+  seed; 60 s put the learner below the floor and seeded it by snapshot."
+  [secs gen]
+  (NotBefore. (long (util/secs->nanos secs)) gen))
+
 (defn package
   "A nemesis package for placement churn, shaped like the ones
   `jepsen.nemesis.combined` returns.
@@ -342,6 +457,7 @@
           (warn "placement fault requested without --replication-factor; disabled"))
         {:generator nil :final-generator nil :nemesis nil :perf #{}})
     {:generator       (->> (fault-generator (:placement-nodes-out opts 1))
+                           (not-before (:placement-warmup opts 60))
                            (gen/stagger (:placement-interval opts 30)))
      ;; Everything comes back before the final read, so the last generator phase
      ;; runs against a whole roster. One :recommission per node that could be

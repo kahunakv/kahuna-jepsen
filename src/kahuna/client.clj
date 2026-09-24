@@ -244,17 +244,19 @@
                    :as                 :json})))))
 
 (defn get!
-  "GETs `path` on `node`, parsed as JSON."
+  "GETs `path` on `node`, parsed as JSON. `:query-params` in `opts` is passed
+  through to clj-http, which URL-encodes it — a key space carries a `/`."
   ([node path] (get! node path {}))
   ([node path opts]
    (let [timeout (:timeout opts 5000)]
      (normalize
        (http/get (str (base-url node) path)
-                 {:accept             :json
-                  :socket-timeout     timeout
-                  :connection-timeout timeout
-                  :throw-exceptions   false
-                  :as                 :json})))))
+                 (cond-> {:accept             :json
+                          :socket-timeout     timeout
+                          :connection-timeout timeout
+                          :throw-exceptions   false
+                          :as                 :json}
+                   (:query-params opts) (assoc :query-params (:query-params opts))))))))
 
 ;; ---------------------------------------------------------------------------
 ;; Key/value operations
@@ -605,6 +607,44 @@
                                                :role     (replica-role (:role x))})
                                             (:replicas p))}]))
              (:partitions r))})))
+
+(defn routing-metadata
+  "Reads /v1/cluster/routing, narrowed to `key-space` when one is given — the
+  routing rule as `node` has applied it. Returns nil when the node cannot
+  answer.
+
+  For a key space under key-range routing the answer carries its descriptors,
+  each naming the partition that owns a range. For a hash-routed key space it
+  carries *no* partition: only the rule — `:hash-algorithm`, `:hash-pool-size`
+  and `:hash-partition-offset` — and the caller computes the partition with
+  `kahuna.hash`. `:coherent` false means the map changed while the node was
+  reading it and the answer should be fetched again."
+  ([node] (routing-metadata node nil))
+  ([node key-space]
+   (let [r (get! node "/v1/cluster/routing"
+                 (cond-> {:timeout 3000}
+                   key-space (assoc :query-params {:keySpace key-space})))]
+     (when (= 200 (:status r))
+       {:initialized           (true? (:initialized r))
+        :coherent              (true? (:coherent r))
+        :hash-algorithm        (:hashAlgorithm r)
+        :hash-pool-size        (:hashPoolSize r)
+        :hash-partition-offset (:hashPartitionOffset r)
+        :key-spaces
+        (mapv (fn [ks]
+                {:key-space    (:keySpace ks)
+                 :routing-mode (:routingMode ks)
+                 :ranges       (mapv (fn [rg]
+                                       {:start-key    (:startKey rg)
+                                        :end-key      (:endKey rg)
+                                        :partition-id (:partitionId rg)
+                                        :generation   (:generation rg)})
+                                     (:ranges ks))})
+              (:keySpaces r))
+        :leaders
+        (into (sorted-map)
+              (map (fn [l] [(:partitionId l) (:endpoint l)]))
+              (:leaders r))}))))
 
 (defn set-replication-factor!
   "Commits a per-partition replication-factor override (0 clears it, so the

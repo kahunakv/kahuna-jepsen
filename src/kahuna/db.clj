@@ -563,6 +563,14 @@
     (kc/cluster-placement node)
     (catch Object _ nil)))
 
+(defn routing
+  "The routing rule and, for `key-space`, its descriptors as seen by `node`, or
+  nil if it cannot answer. Pass-through to the client, like `placement`."
+  [node key-space]
+  (try+
+    (kc/routing-metadata node key-space)
+    (catch Object _ nil)))
+
 (defn cluster-placement
   "Every node's view of the placement table: {node → placement-or-nil}.
 
