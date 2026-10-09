@@ -265,103 +265,60 @@ jobs:
           # profile where a repair is unavoidable -- kill the node holding a
           # range and the planner has to rebuild it somewhere else from nothing.
           #
-          # This job has been retuned four times in a day, so the reasoning is
-          # written out rather than left in the diff.
+          # The settings below were fixed in August 2026, when the job was retuned
+          # four times in a day, and re-measured on 2026-10-08 over every run since.
           #
-          # `nemesis_interval: 45` (default 15) is the load-bearing one, and it
-          # exists because the job turned out to be **bistable**, not because
-          # anything regressed. Two runs on the same server build and the same
-          # config landed in opposite states:
+          # `nemesis_interval: 45` (default 15). In August the job was bistable: two
+          # runs on the same server build and the same config landed in opposite
+          # states (run 32203864431: 7 replicas gained, 20/20 recovery windows, 928
+          # ok; run 32211997573: 3 gained, 0/20, 6 ok). The collapsed shape fits a
+          # Kommander election bug found a fortnight later (Kommander 475e2c60,
+          # fixed in 791eec9 / 1.5.1, adopted by kahuna f11880f on 2026-09-03): a
+          # sole voter could not win an election while a learner sat in its replica
+          # set, so at RF 1 one kill of a voter mid-repair left that range without a
+          # leader for the rest of the run. The log-level proof of that mechanism on
+          # the August runs is not available (the node logs expired); the count is.
+          # In 37 of 37 nightlies after the fix no run collapsed (ok 751 to 4,132),
+          # against 3 of 18 before it. The interval stays at 45 s until a return to
+          # 15 s is measured on its own.
           #
-          #   run 32203864431:  7 replicas gained, 4 partitions moved,
-          #                     20/20 recovery windows recovered,  928 ok
-          #   run 32211997573:  3 replicas gained, 2 partitions moved,
-          #                      0/20 recovery windows recovered,    6 ok
+          # `placement_nodes_out: none` drops the decommission. Kommander documents
+          # RF-1 decommission as unsupported (`b2e2ee03`: a range with one voter has
+          # nowhere to hand off). The one question that justified testing it anyway
+          # -- whether a timed-out drain rolls back cleanly -- was answered by run
+          # 32206164668: the drain committed and `Suppressing pre-vote: local role
+          # is Leaving` appears zero times across all six node logs.
           #
-          # No Kahuna commit landed between them (70b75d2 predates both), and
-          # the only matrix difference was a checker-only flag. The difference
-          # is a feedback loop: at RF 1 a killed node's ranges are dead until
-          # rebuilt, a rebuild is add-learner -> seed -> promote -> retire, and
-          # a kill every 15 s does not leave room for one. Fall behind early and
-          # more ranges stay dead, throughput drops, repairs slow further, and
-          # the run never comes back. At RF 3 this never surfaces because the
-          # surviving replicas serve straight through it.
+          # `key_count` stays at the default 5 and `partitions` at 8. Raising keys to
+          # 25 and cutting partitions to 3 were both attempts to buy seeding
+          # evidence; both backfired, because at RF 1 anything that widens the blast
+          # radius of a kill costs write volume rather than gaining it.
           #
-          # So 45 s. The job exists to prove the planner can rebuild a range
-          # from nothing, and that requires the workload to survive long enough
-          # to *observe* the rebuild.
+          # `placement_evidence: move` is the same property the RF-3 jobs assert: a
+          # committed replica set changed. From 2026-09-03 to 2026-10-08 this job ran
+          # with the weaker `transfer` ("a move started") because of the election bug
+          # above: with learners never promoted, `move` stayed 0 on runs whose
+          # planner had done everything it could. Every one of the 37 post-fix runs
+          # shows `move` between 10 and 43, so the stronger gate is back.
           #
-          # `placement_nodes_out: none` drops the decommission. It was dropped
-          # on 2026-08-18, restored, then dropped again -- the restoration is
-          # what produced the 331-op and 3-op runs above. Kommander documents
-          # RF-1 decommission as unsupported (`b2e2ee03`: a range with one voter
-          # has nowhere to hand off), and the one question that justified
-          # testing it anyway -- whether a timed-out drain rolls back cleanly --
-          # was answered by run 32206164668: the drain **committed**
-          # (`{:drained true, :outcome "Committed", :left true}`) and
-          # `Suppressing pre-vote: local role is Leaving` appears zero times
-          # across all six node logs, where the wedge had 721 on one node.
+          # What this job still does not ask for, and why:
           #
-          # `key_count` stays at the default 5 and `partitions` at 8. Raising
-          # keys to 25 and cutting partitions to 3 were both attempts to buy
-          # seeding evidence; both backfired, because at RF 1 anything that
-          # widens the blast radius of a kill costs write volume rather than
-          # gaining it.
+          #   seeding  A snapshot seed beats log replay only when the learner starts
+          #            below the WAL compaction floor, which needs a write volume RF 1
+          #            does not reach (20 compaction passes against 928 and 1188 in
+          #            the RF-3 jobs). Post-fix it shows in 27 of 37 runs, which is
+          #            not something to go red on three nights in ten.
+          #   purge    Shown in all 37 post-fix runs (8 to 44), so it could be asked
+          #            for. It is left out so this job changes one thing at a time;
+          #            widen the gate after the `move` count is in.
           #
-          # `placement_evidence: transfer` narrows this job's vacuity gate, and
-          # narrows only this job's. It arrived there in three steps, and the
-          # first two were each made from a single sample:
-          #
-          #   run 32203864431   move 7   purge ?   seeding 0   -> dropped seeding
-          #   run 32211997573   move 3   purge 2   seeding 0
-          #   run 32215919532   move 7   purge 0   seeding 0   -> dropped purge
-          #
-          # `seeding` went first, and that reasoning holds: a snapshot beats log
-          # replay only when the learner starts below the WAL compaction floor,
-          # which needs a write volume RF 1 does not reach -- 20 compaction
-          # passes here against 928 and 1188 in the RF-3 jobs.
-          #
-          # `purge` went second. It was kept on the strength of one run where it
-          # happened to be 2, and the very next run had `unhosted 0` with seven
-          # replicas gained and none lost: without the decommission, `clear-rf`
-          # does not reliably drive a replica all the way to un-host inside a
-          # run.
-          #
-          # `move` went third, and this is the step the three samples above were
-          # too few to see. It is not reliably producible here either:
-          #
-          #   run 33490135392   9 overrides   3 learners    0 gained   red
-          #   run 33607803563  10 overrides   4 learners    0 gained   red
-          #   run 33733278963  14 overrides  16 learners   13 gained   green
-          #
-          # On the two red runs the planner added Learners and promoted none of
-          # them, so the committed voter set never changed and `move` stayed 0.
-          # It is not a timing artefact of the nemesis: run 33607803563 held its
-          # overrides for 22-55 s and promoted nothing, while run 33733278963
-          # held one for 0.7 s and still gained 13 voters across the run. The
-          # runs differ in the server build -- `KAHUNA_REF: main` is resolved
-          # afresh every night -- so **the stall is a Kahuna suspect, not a
-          # harness one**, and it is filed as such rather than tuned away here.
-          #
-          # So this job now claims the weaker property it can always show: the
-          # planner *started* a move. `transfer` counts a replica observed in a
-          # transitional role, which no amount of booting or restarting can
-          # fake -- a node comes up in whatever role the committed map already
-          # gives it, and a Learner exists only because the planner decided to
-          # change that map. A run where the nemesis achieved nothing still
-          # comes back `:vacuous`, which is what the gate is for.
-          #
-          # Be explicit about what this job no longer asserts. **Completed moves
-          # at RF 1 are now unasserted.** The six RF-3 placement jobs cover
-          # completed moves, and they import 2-7 partitions and purge 32-135
-          # each on a green run. If those ever stop reporting `imported > 0` or
-          # `unhosted > 0`, that is the alarm this job can no longer raise.
-          #
-          # What survives here is every safety property, which is checked on
-          # every run whatever the gate says: single mover per range, no lost
-          # range, and no two nodes disagreeing about one generation. At RF 1
-          # those are the ones that matter, because a botched move with one copy
-          # of the data is data loss rather than degradation.
+          # What every placement job asserts on top of its gate, since 2026-10-08:
+          # no move that started on the healed cluster is left unfinished. After the
+          # final heal the sampler keeps reading the table for ~62 s, and a replica
+          # still Learner or Removing at the end of it, for ten placement passes or
+          # more, is a `:stalled-move` violation. That is the exact shape the
+          # election bug produced, and the gate alone cannot see it: one completed
+          # move makes `move` non-zero while seven others stay stuck.
           - workload: register
             faults: kill,placement
             nodes: n1,n2,n3,n4,n5,n6
@@ -373,7 +330,7 @@ jobs:
             partitions: 8
             replication_factor: 1
             placement_nodes_out: none
-            placement_evidence: transfer
+            placement_evidence: move
             force_compaction: true
           # Scale-down: walk the roster from six nodes toward the replication
           # factor and back. The planner must degrade toward fuller replication

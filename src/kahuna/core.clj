@@ -137,6 +137,13 @@
                       :placement-nodes-out       (:placement-nodes-out opts 1)
                       :placement-sampling        (get opts :placement-sampling true)
                       :placement-sample-interval (:placement-sample-interval opts 3)
+                      ;; The settle window after the final heal is sized from
+                      ;; the same two values the checker's stalled-move bound
+                      ;; is, so the sampler always covers what the checker
+                      ;; will ask about.
+                      :placement-pass-interval   (:placement-pass-interval opts)
+                      :stalled-move-passes       (:stalled-move-passes opts
+                                                   placement-checker/default-stalled-move-passes)
                       ;; Range knobs. Both the nemesis and its sampler refuse to
                       ;; run without a key-range-routed key space, so an
                       ;; unregistered run is left exactly as it was.
@@ -489,6 +496,22 @@
     :validate [#(every? (set placement-checker/evidence-kinds) %)
                (str "must be 'none' or a comma-separated subset of "
                     (str/join ", " (map name placement-checker/evidence-kinds)))]]
+
+   [nil "--stalled-move-passes N" "Placement passes a replica may stay Learner
+                                  or Removing on a healed cluster before the
+                                  move counts as stalled. After the final heal
+                                  the sampler keeps reading the placement
+                                  table for this many passes (at
+                                  --placement-pass-interval, or the server's
+                                  5 s default) plus four sample intervals; a
+                                  replica still mid-move at the end of that
+                                  window, for at least the bound, is a
+                                  :stalled-move violation. The vacuity gate
+                                  proves a move finished; this proves no move
+                                  that started was left unfinished."
+    :default placement-checker/default-stalled-move-passes
+    :parse-fn read-string
+    :validate [pos? "must be positive"]]
 
    ;; ── Key-range routing ───────────────────────────────────────────────────
    ;;

@@ -193,7 +193,17 @@ and is why it belongs to a chaos profile and nowhere else.
 **RF 1 as well as RF 3.** At one replica per range there is no second copy to
 absorb a mistake, so a purge that ran too early or a seed that arrived
 incomplete is data loss rather than degradation. It is the cheapest
-configuration with the sharpest signal.
+configuration with the sharpest signal, and it asserts the same thing the RF 3
+jobs do: a completed move (`placement_evidence: move`). It asks for neither
+`seeding` nor `purge`. A snapshot seed beats log replay only when the learner
+starts below the WAL compaction floor, and at RF 1 one partition writes one WAL
+per operation — 20 compaction passes against 928 and 1,188 in the RF 3 jobs —
+so a seed happens in about three runs of four and cannot be demanded nightly.
+The job ran with the weaker `transfer` gate ("a move started") from 2026-09-03
+to 2026-10-08 while a Kommander election bug kept learners from ever being
+promoted (a sole voter could not win an election while a learner sat in its
+replica set, Kommander 1.5.1); 37 of 37 nightlies after the fix completed moves,
+so the gate went back to `move`.
 
 ### A leave here goes through the API, not through SIGTERM
 
@@ -238,6 +248,21 @@ evidence it demands is read from two places: the sampled placement tables (did a
 committed replica set change?) and the server logs (`Imported whole-partition
 state` for seeding, `Stopped hosting` for the un-host purge). Jepsen captures
 node logs before it checks, so reading them there is sound.
+
+The gate proves that at least one move finished. It cannot see the opposite
+failure — a move that started and never finished — and that is the shape the
+RF 1 stall took: one completed move makes `move` non-zero while every other
+learner stays a learner. So the sampler owns a **settle window**. Once every
+fault package's final generator has put the cluster back, it records a
+`:placement-settle` marker and keeps sampling for the stalled-move bound (ten
+placement passes, about 50 s) plus four sample intervals. A replica still
+Learner or Removing at the end of that window, and for at least the bound, is
+a `:stalled-move` violation that fails the run. Only settled time counts
+toward the bound: mid-run a learner may legitimately wait out a kill, and at
+RF 1 the only copy to seed from *is* the voter the nemesis just stopped, so a
+move stuck behind a fault is given the whole bound after the heal before it is
+called stuck. A window shorter than the bound comes back `:unmeasured`, never
+clean.
 
 The safety properties it does assert are the ones Kommander states as
 invariants — single mover per range, one committed map everywhere at a given

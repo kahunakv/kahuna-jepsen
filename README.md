@@ -122,6 +122,26 @@ so `PartitionStateTransfer` was not exercised — usually `--force-compaction`
 missing, or a run too short to compact. `--require-placement-evidence` chooses
 what a run must demonstrate; `none` switches the gate off.
 
+The gate proves that at least one move finished. It cannot see a move that
+started and never finished, so after the final heal the sampler keeps reading
+the placement table for a settle window (`--stalled-move-passes`, default 10
+placement passes, plus four sample intervals — about a minute). A replica that
+is still a Learner or Removing at the end of that window, and was for at least
+the bound, is a `:stalled-move` violation and fails the run:
+
+```clojure
+:placement {:valid? false, :violations [{:type :stalled-move, :partition 3,
+                                         :endpoint "n4:8082", :role :learner,
+                                         :duration-secs 58.0, :bound-secs 50.0}]}
+```
+
+Only the settled part of the run counts toward the bound. Mid-run a Learner may
+legitimately wait out a kill — at RF 1 the only copy to seed from is the voter
+the nemesis just stopped — so a move that was stuck behind a fault gets the
+whole bound after the heal before it is called stalled. The verdict's `:settle`
+key reports the window, the sample count and the longest any replica stayed
+mid-move inside it; a window shorter than the bound comes back `:unmeasured`.
+
 ### The key-range profile
 
 By default a key is routed to a partition by hashing its key space, and the

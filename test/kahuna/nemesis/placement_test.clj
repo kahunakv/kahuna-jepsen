@@ -10,6 +10,7 @@
   (:require [clojure.test :refer [deftest is testing]]
             [jepsen.generator :as gen]
             [jepsen.generator.context :as context]
+            [jepsen.nemesis :as n]
             [kahuna.nemesis.placement :as placement]))
 
 (def ^:private gen #'placement/fault-generator)
@@ -150,3 +151,52 @@
           ctx  (context/context test)
           [op] (gen/op (placement/not-before 30 (gen 3)) test ctx)]
       (is (= :decommission (:f op))))))
+
+;; ---------------------------------------------------------------------------
+;; The settle window: the sampler keeps looking after the final heal
+;; ---------------------------------------------------------------------------
+;;
+;; The checker's stalled-move property reads only the samples taken after the
+;; `:placement-settle` marker, and it needs those samples to span at least the
+;; bound. Both of those are this package's job, so what is pinned here is the
+;; shape of its final generator and the arithmetic that sizes the window.
+
+(def ^:private settle-opts
+  "RF 3, sampling every 3 s, a 1 s placement pass and a two-pass bound: a 2 s
+  bound and a 14 s window."
+  {:replication-factor 3
+   :placement-sample-interval 3
+   :placement-pass-interval 1000
+   :stalled-move-passes 2})
+
+(deftest the-settle-window-is-the-bound-plus-four-sample-intervals
+  (is (= 14.0 (placement/settle-window settle-opts)))
+  (testing "at the defaults it is ten 5 s passes plus four 3 s samples"
+    (is (= 62.0 (placement/settle-window {})))))
+
+(deftest the-final-generator-opens-with-the-settle-marker
+  ;; The marker must be the first thing emitted once the fault packages have
+  ;; healed, or the first settled samples would be read as pre-heal and the
+  ;; window would come up short of the bound.
+  (let [test (assoc test-map :concurrency 2)
+        ctx  (context/context test)
+        [op] (gen/op (:final-generator (placement/sampler-package settle-opts))
+                     test ctx)]
+    (is (= :placement-settle (:f op)))
+    (is (= :info (:type op)))))
+
+(deftest the-settle-marker-records-the-bound-and-window-in-force
+  ;; A history explains its own verdict: the bound the checker will apply and
+  ;; the window the sampler promised are both on the marker's completion.
+  (let [s  (placement/sampler settle-opts)
+        op (n/invoke! s test-map {:type :info :f :placement-settle})]
+    (is (= {:bound-secs 2.0 :window-secs 14.0} (:value op)))))
+
+(deftest sampling-is-off-at-full-replication-settle-window-included
+  ;; RF 0 has no replica sets to watch, so the package must stay the no-op it
+  ;; always was -- a settle window on a legacy job would add a minute to every
+  ;; run in the matrix for nothing.
+  (let [pkg (placement/sampler-package {:replication-factor 0})]
+    (is (nil? (:generator pkg)))
+    (is (nil? (:final-generator pkg)))
+    (is (nil? (:nemesis pkg)))))

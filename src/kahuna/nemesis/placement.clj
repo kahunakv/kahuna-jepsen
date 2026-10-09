@@ -76,12 +76,19 @@
   Every node is asked, not one. The map is committed on the meta partition, so
   two nodes reporting the same partition at the same generation must report an
   identical replica set — a disagreement is a finding no single-node read could
-  ever surface. See `kahuna.checker.placement`."
+  ever surface. See `kahuna.checker.placement`.
+
+  The sampler also owns the **settle window**: after every fault package has
+  put the cluster back, it records a `:placement-settle` marker and keeps
+  sampling for a bounded time. Those samples are the only ones that can show
+  whether a move finishes on a cluster with nothing wrong with it, which is
+  what the checker's `:stalled-move` property needs — see `settle-window`."
   (:require [clojure.tools.logging :refer [info warn]]
             [jepsen [control :as c]
                     [generator :as gen]
                     [nemesis :as n]]
             [jepsen.util :as util]
+            [kahuna.checker.placement :as placement-checker]
             [kahuna.client :as kc]
             [kahuna.db :as kdb]
             [kahuna.hash :as hash]))
@@ -476,21 +483,51 @@
 ;; Sampling
 ;; ---------------------------------------------------------------------------
 
+(defn settle-window
+  "Seconds the sampler keeps reading the table after the final heal.
+
+  The checker calls a move stalled when a replica sits in a transitional role
+  for `stalled-move-bound` seconds of settled time, and it can only measure
+  what the samples span. The window is the bound plus four sample intervals,
+  so a replica mid-move for the whole window is observed for at least the
+  bound even after the first and last samples are discounted. At the defaults
+  (ten passes of 5 s, sampling every 3 s) that is 62 s on the end of each
+  placed run — paid once, and it is what turns 'some move finished' into
+  'every move that started on a healthy cluster finished'."
+  [opts]
+  (+ (placement-checker/stalled-move-bound opts)
+     (* 4 (:placement-sample-interval opts 3))))
+
 (defn sampler
-  "A nemesis whose only operation records every node's view of the placement
-  table. Never waits on anything: an unreachable node contributes nil, and a
-  sample is one HTTP round trip per node from the control node."
-  []
+  "A nemesis that records every node's view of the placement table, and marks
+  the start of the settle window. Never waits on anything: an unreachable
+  node contributes nil, and a sample is one HTTP round trip per node from the
+  control node.
+
+  `:placement-settle` records nothing about the cluster. Its completion time
+  is the fact: every fault package's final generator has run by then, so the
+  samples after it describe a healed cluster. The value carries the bound and
+  window in force so a history explains its own verdict."
+  [opts]
   (reify n/Nemesis
     (setup! [this test] this)
 
     (invoke! [this test op]
-      (assoc op :value (kdb/cluster-placement test)))
+      (case (:f op)
+        :placement-sample
+        (assoc op :value (kdb/cluster-placement test))
+
+        :placement-settle
+        (let [bound  (placement-checker/stalled-move-bound opts)
+              window (settle-window opts)]
+          (info "placement: cluster healed; sampling for" window
+                "s to catch a move that does not finish within" bound "s")
+          (assoc op :value {:bound-secs bound :window-secs window}))))
 
     (teardown! [this test])
 
     n/Reflection
-    (fs [this] #{:placement-sample})))
+    (fs [this] #{:placement-sample :placement-settle})))
 
 (defn sampler-package
   "A placement-sampling package, shaped for `nc/compose-packages`.
@@ -500,6 +537,14 @@
   node's ranges get repaired onto survivors), and a run that cannot see that
   happen cannot claim it did.
 
+  The final generator is the settle window. `compose-packages` runs final
+  generators in package order, and this package is composed after every fault
+  package, so the `:placement-settle` marker lands once the killed nodes are
+  restarted, the partitions healed and the decommissioned nodes rejoined. The
+  samples that follow are taken at a fixed cadence (`gen/delay`, not
+  `gen/stagger`) so the window's span is predictable: a staggered window could
+  come up short of the bound by chance and turn a clean run `:unmeasured`.
+
   Deliberately absent from `:perf` — these are observations, not faults, and a
   stripe every few seconds on the latency plot would bury the faults that
   matter."
@@ -507,8 +552,12 @@
   (if-not (and (pos? (or (:replication-factor opts) 0))
                (:placement-sampling opts true))
     {:generator nil :final-generator nil :nemesis nil :perf #{}}
-    {:generator       (->> (repeat {:type :info, :f :placement-sample})
-                           (gen/stagger (:placement-sample-interval opts 3)))
-     :final-generator nil
-     :nemesis         (sampler)
-     :perf            #{}}))
+    (let [interval (:placement-sample-interval opts 3)]
+      {:generator       (->> (repeat {:type :info, :f :placement-sample})
+                             (gen/stagger interval))
+       :final-generator [{:type :info, :f :placement-settle}
+                         (->> (repeat {:type :info, :f :placement-sample})
+                              (gen/delay interval)
+                              (gen/time-limit (settle-window opts)))]
+       :nemesis         (sampler opts)
+       :perf            #{}})))

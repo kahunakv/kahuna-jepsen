@@ -82,6 +82,14 @@
     voter can commit nothing; the range is offline and no quorum can restore it.
   * **Replicas live on nodes the test knows about.** An endpoint belonging to no
     node in the roster is a map that has outlived its cluster.
+  * **A move that started on a healed cluster finishes.** The vacuity gate
+    proves that at least one move completed; it says nothing about a move that
+    began and never ended, which is the exact shape of the RF-1 stall (learners
+    added, none promoted). So after the final heal the sampler keeps reading
+    the table for a settle window, and a replica still Learner or Removing at
+    the end of it, for longer than `stalled-move-bound` with no fault in the
+    way, is a `:stalled-move` violation. See `stalled-moves` for how the window
+    is measured and why only the healed part of the run counts.
 
   Not checked, on purpose:
 
@@ -119,6 +127,25 @@
        (h/remove h/client-op?)
        (filter #(and (= :placement-sample (:f %)) (map? (:value %))))
        (mapv (fn [op] {:time (:time op) :views (:value op)}))))
+
+(defn settle-marker
+  "When the final heal ended and the settle window began: the completion of the
+  sampler's `:placement-settle` op, as `{:time nanos :bound-secs b :window-secs
+  w}`, or nil when the run never recorded one.
+
+  The marker is emitted by the sampler's final generator, which jepsen runs
+  only after every fault package's own final generator has put the cluster
+  back. That makes it the one point in the history that says 'every fault is
+  healed from here on' without the checker having to know which ops are faults
+  and which are observations. A history without it — an older run, or a run
+  with sampling switched off — cannot say what the planner did on a healed
+  cluster, and `stalled-moves` reports itself unmeasured rather than guess."
+  [history]
+  (->> (h/history history)
+       (h/remove h/client-op?)
+       (filter #(and (= :placement-settle (:f %)) (map? (:value %))))
+       (map (fn [op] (assoc (:value op) :time (:time op))))
+       last))
 
 (defn- replica-set
   "A partition view's replica set in a comparable form: endpoints paired with
@@ -329,6 +356,138 @@
                           (not-any? #(= (:endpoint placement) (:endpoint %))
                                     (:replicas view)))]
            {:node node :partition pid :generation (:generation view)}))))
+
+;; ---------------------------------------------------------------------------
+;; Stalled moves
+;; ---------------------------------------------------------------------------
+
+(def default-stalled-move-passes
+  "How many placement passes a replica may sit in a transitional role on a
+  healed cluster before the move is called stalled. A relocation costs about
+  three passes plus a trim (`--raft-placement-pass-interval` help text), and a
+  seed in between; ten is several times that, so a bound this wide is not a
+  calibration of the planner's speed, only a line between 'slow' and 'never'."
+  10)
+
+(def default-placement-pass-interval-ms
+  "The server's default for `--raft-placement-pass-interval`, used to size the
+  bound when the harness leaves the flag unset."
+  5000)
+
+(defn stalled-move-bound
+  "Seconds a replica may stay Learner or Removing on a healed cluster: the
+  configured number of placement passes at the server's pass interval.
+
+  Read from the test map rather than fixed, so a profile that slows the pass
+  down (or speeds it up) moves the bound with it. A pass interval of 0 means
+  the server runs commit-driven passes only; the bound then falls back to the
+  server default, because 'no timer' is not 'infinitely fast'."
+  [test]
+  (let [passes (:stalled-move-passes test default-stalled-move-passes)
+        ms     (let [n (:placement-pass-interval test)]
+                 (if (and n (pos? n)) n default-placement-pass-interval-ms))]
+    (/ (* passes ms) 1000.0)))
+
+(defn- freshest-views
+  "For one sample, the newest view of each partition across the nodes that
+  answered: partition → view with the highest generation.
+
+  Nodes lag behind the committed map, and a lagging node still reports the
+  replica it saw mid-move. Reading the stale view would call a move stalled
+  for as long as one node was behind — the highest generation is the committed
+  truth as far as this sample can tell it."
+  [views]
+  (reduce
+    (fn [acc [_node placement]]
+      (reduce
+        (fn [acc [pid view]]
+          (if (< (:generation (get acc pid {:generation -1})) (:generation view))
+            (assoc acc pid view)
+            acc))
+        acc
+        (:partitions placement)))
+    {}
+    (filter (comp map? val) views)))
+
+(defn stalled-moves
+  "Replicas still mid-move at the end of the run, after sitting in a
+  transitional role for at least `bound-secs` with every fault healed.
+
+  `samples` are the settled samples only — those taken after `settle-marker`.
+  Restricting the input is what makes the bound honest. Mid-run a Learner may
+  legitimately wait out a kill: at RF 1 the only copy to seed from is the
+  voter the nemesis just killed, and a 45 s kill interval means a healthy
+  learner can sit for a minute. Measuring from the heal instead of from the
+  first sighting means a mover that was stuck behind a fault is given the
+  whole bound to recover before it is called stalled.
+
+  Within the settled samples each (partition, endpoint, role) is tracked as a
+  continuous span: opened when the partition's freshest view first shows it in
+  a transitional role, extended on every settled sample that still shows it,
+  closed by the first sample whose freshest view does not. A sample in which
+  no node answered for the partition neither extends nor closes a span. The
+  spans still open at the last sample are the moves that never finished, and
+  those at least `bound-secs` long are the violations.
+
+  Returns `{:measured? bool :window-secs w :samples n :stalled [...]
+  :longest-secs x}`. `:measured? false` means the settled samples span less
+  than the bound, so a stall could not have been observed: a window shorter
+  than the bound, or no settled sample at all."
+  [samples bound-secs]
+  (let [first-t (:time (first samples))
+        last-t  (:time (last samples))
+        window  (if (and first-t last-t) (/ (- last-t first-t) 1e9) 0.0)
+        ;; open: [pid endpoint role] → {:first t :generation g}
+        [open longest]
+        (reduce
+          (fn [[open longest] {:keys [time views]}]
+            (let [fresh (freshest-views views)
+                  ;; Movers visible in this sample's freshest views.
+                  now   (into {}
+                              (for [[pid view] fresh
+                                    r (:replicas view)
+                                    :when (kc/transitional-roles (:role r))]
+                                [[pid (:endpoint r) (:role r)]
+                                 {:generation (:generation view)}]))
+                  ;; Close spans whose partition answered and no longer shows
+                  ;; the mover; keep those whose partition had no view.
+                  [open longest]
+                  (reduce (fn [[open longest] [k span]]
+                            (if (and (contains? fresh (first k))
+                                     (not (contains? now k)))
+                              [(dissoc open k)
+                               (max longest (/ (- (:last span) (:first span)) 1e9))]
+                              [open longest]))
+                          [open longest]
+                          open)
+                  open (reduce (fn [open [k m]]
+                                 (if-let [span (get open k)]
+                                   (assoc open k (assoc span :last time
+                                                        :generation (:generation m)))
+                                   (assoc open k {:first time :last time
+                                                  :generation (:generation m)})))
+                               open
+                               now)]
+              [open longest]))
+          [{} 0.0]
+          samples)
+        stalled (vec (sort-by (juxt :partition :endpoint)
+                       (for [[[pid ep role] span] open
+                             :let [secs (/ (- (:last span) (:first span)) 1e9)]
+                             :when (>= secs bound-secs)]
+                         {:type :stalled-move :partition pid :endpoint ep :role role
+                          :generation (:generation span)
+                          :first-seen (:first span) :last-seen (:last span)
+                          :duration-secs secs :bound-secs bound-secs})))
+        longest (reduce max longest
+                        (map (fn [[_ span]] (/ (- (:last span) (:first span)) 1e9))
+                             open))]
+    {:measured?    (boolean (and (seq samples) (>= window bound-secs)))
+     :bound-secs   bound-secs
+     :window-secs  window
+     :samples      (count samples)
+     :stalled      stalled
+     :longest-secs longest}))
 
 ;; ---------------------------------------------------------------------------
 ;; Evidence from the server logs
@@ -550,12 +709,18 @@
   * `:valid? true` — placement behaved, and the run demonstrated it did
     something.
   * `:valid? false` — a safety property broke. `:violations` and
-    `:disagreements` say which and where.
+    `:disagreements` say which and where. A `:stalled-move` violation is a
+    replica that was still mid-move at the end of the settle window after the
+    final heal, for at least `stalled-move-bound` seconds — a move that began
+    and never finished on a cluster with nothing wrong with it.
   * `:valid? :unknown` — nothing was proven, with three causes worth telling
     apart. `:vacuous` means the run never moved a replica; `:stalled` means it
     added Learners and completed no move, which is a different and more
-    interesting failure; `:unmeasured` means it could not be observed at all.
-    Read any of them as 'this run settled nothing', never as a pass.
+    interesting failure; `:unmeasured` means it could not be observed at all —
+    an evidence kind with nothing to read it from, or a settle window too
+    short to tell a slow move from a stuck one (`:unmeasured` names
+    `:stalled-move` in that case). Read any of them as 'this run settled
+    nothing', never as a pass.
 
   At replication factor 0 this returns `:valid? true` and makes no claim:
   full replication has no replica sets to place, and every property above is
@@ -568,7 +733,17 @@
          :note "full replication; placement not under test"}
         (let [ss       (samples history)
               logs     (log-evidence test)
-              vs       (into (violations test ss) (disagreements ss))
+              marker   (settle-marker history)
+              ;; Only samples taken after the final heal can say whether a
+              ;; move finishes on a healthy cluster; without the marker there
+              ;; is no such sample, and the check reports itself unmeasured.
+              settled  (if marker
+                         (filterv #(< (:time marker) (:time %)) ss)
+                         [])
+              stall    (stalled-moves settled (stalled-move-bound test))
+              vs       (-> (violations test ss)
+                           (into (disagreements ss))
+                           (into (:stalled stall)))
               move     (movement ss)
               roles    (roles-observed ss)
               ev       (evidence ss logs)
@@ -578,12 +753,23 @@
                                                            default-required-evidence))
                          #{})
               {:keys [shown missing unmeasured]} (gate required ev)
+              ;; The stall check is not evidence — it is a safety property —
+              ;; but 'could not look' is the same answer either way, so it
+              ;; joins the unmeasured list rather than passing silently.
+              unmeasured (cond-> unmeasured
+                           (not (:measured? stall)) (conj :stalled-move))
               base     {:replication-factor (kdb/replication-factor test)
                         :samples            (count ss)
                         :evidence           ev
                         :evidence-required  (vec (sort required))
                         :movement           (dissoc move :transitions)
                         :transitional       roles
+                        ;; The settle window after the final heal: how long
+                        ;; it was, how many samples it held, and the longest
+                        ;; any replica stayed mid-move inside it. The
+                        ;; stalled entries also appear in :violations.
+                        :settle             (assoc (dissoc stall :stalled)
+                                                   :marker (some-> marker (dissoc :time)))
                         ;; Informational: see `hosting-lag`. A non-empty list at
                         ;; the end of a run is a purge that did not finish.
                         :hosting-lag        (hosting-lag ss)
