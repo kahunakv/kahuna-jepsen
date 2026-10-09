@@ -51,7 +51,49 @@ Not started:
       (`src/kahuna/checker/range.clj`). **Green 2026-08-17** at RF 0 — six
       splits, two merges, no id reused — see below.
 
-## Open: read skew (`:G-single-item`) with nothing broken at all
+## Fixed, awaiting the nightly count: a split reuses a spent partition id
+
+> **Status (Vorpal `f60d4514`): IN_PROGRESS — root cause found and fixed 2026-10-08, nightly count 0
+> of 15.** Not the allocator and not a dropped tombstone in a handler: a **lost update of the whole
+> partition map inside Kommander's system coordinator**. On the P0 leader, a map handler installs its
+> committed map directly, and the log applicator later delivers the same entry again as a
+> `ConfigReplicated` echo, which overwrote the local map unconditionally. Under the network partition,
+> `TryAddReplica` held the coordinator loop for 53 s and then 18 s (`ConfirmPartitionLeadershipAsync`).
+> Echoes queued behind it landed after newer commits, the local map went back to an older version,
+> and the next handler rewrote the whole map from that old base. On n2 on Oct 6, P0 entries #73 and
+> #78 were written from the #70 and #74 bases: the create (#72) and the tombstone (#76) of the first
+> partition 12 vanished, and n3 allocated 12 again. 11 survived because its removal (#70) preceded
+> every old base. Fixed in Kommander `5cc2c73` (released 1.10.3): system entries install in log
+> order, once. Kahuna's `RangeMapStore` had the same two-writer shape and is fixed in kahuna
+> `07f0cf3`, which takes 1.10.3. Tests: Kommander `TestSystemConfigApplyOrder`, Kahuna
+> `TestRangeMapStoreApplyOrder`. The Sept 6 run fits the mechanism, but its node logs expired.
+> Closes after 15 consecutive nightly runs of this job on kahuna `07f0cf3` or later with no
+> `:partition-id-reused` and no `:map-disagreement`; the first eligible nightly is 2026-10-08. The
+> original report is below.
+
+Filed as Vorpal `f60d4514`. Two nightly runs of `append / partition,placement,range` went red on the
+range or placement checker with the workload valid. In both, partition id 12 got a second life at
+generation 1:
+
+* **2026-09-06**, run `34021320163`, kahuna `5ea88d42`: `:partition-id-reused` — a split created 12 at
+  08:20:56, a merge folded it into 9 by 08:22:26, and the split at 08:27:19 created 12 again. That is
+  the shape kahuna `8ecae568` fixed.
+* **2026-10-06**, run `37453086751`, kahuna `f780e4dc` (1.11.2): `:map-disagreement` — n1 and n5
+  reported partition 12 at generation 1 with voters n1 n2 n6, the others with n1 n2 n3. The node
+  logs show the first 12 came from the harness's 11:04:29 split, which the harness recorded as
+  `:attempted false` but n2 ran; the split failed, the orphan was removed through P0, and n3
+  allocated 12 again at 11:11:20. The artifact is kept at
+  `store/ci-artifacts/run-37453086751-append-25/`.
+
+2 of 59 completed runs of that job since 2026-08-19, and 0 in the other range jobs.
+
+## Closed: read skew (`:G-single-item`) with nothing broken at all
+
+> **Status (Vorpal `cfbb55d2`): DONE, verified on run count, 2026-10-07.** Fixed in kahuna `70b75d2`
+> (settle-before-cutover barrier, export integrity). `append / range` from 2026-08-19 to 2026-10-07:
+> 62 job-runs, **58 clean**, 0 `:valid? false`, 4 cancelled before a verdict; 11–25 successful
+> splits per clean run, 1,069 in total. At the 1-in-3 base rate, 58 clean runs by chance is about
+> 6 × 10⁻¹¹. The history below is unchanged.
 
 Filed as `cfbb55d2`. Run `32175423183`, job `append / range` — **the control**. This is the most
 serious finding the suite has produced, and it is the absences that make it so.
@@ -500,7 +542,17 @@ partition, so the requirement is only that the threshold fire early, not that it
 divided by however many Raft groups the traffic is spread across, and `--partitions 8` is part of
 this profile. Calibrating one against a cluster-wide op count will always be wrong by that factor.
 
-## Open: a split's bulk copy fails repeatably, with nothing moving and the network whole
+## Closed: a split's bulk copy fails repeatably, with nothing moving and the network whole
+
+> **Status (Vorpal `a0e95736`): DONE, 2026-10-07.** Root cause: the copy's write leg raced the fresh
+> destination partition's first election with a 2 s budget, and a voter that was not the leader
+> never relayed the page. Fixed in kahuna `5903c53` (2026-09-04): receive-side leader relay,
+> election-sized deadlines, and a `TransferFailed` reason that names the failed step.
+> `register / partition,kill,placement,range` from 2026-09-05 to 2026-10-07: **36 of 36 job-runs
+> clean**, a split landed on every night, 210 of 262 attempts `Succeeded`, **0 `TransferFailed`**.
+> The RF 3 `append / partition,placement,range` job still sees `TransferFailed` (30 of 368 outcomes
+> since the fix, against 64 of 196 before it), now almost all at the completion-receipt handoff, not
+> the bulk copy. Retryable, map unchanged, no record yet. The history below is unchanged.
 
 Filed as `a0e95736` to be investigated, **not** as an established defect. The spec was rewritten on
 2026-08-19 and the section below is chronological: the original claim first, then the retry fix,
@@ -643,7 +695,15 @@ several conditions, which is the same conflation `8ecae568` untangled for `Parti
 `#{"TransferFailed"}` only, but an `Indeterminate` from a transport error leaves the map provably
 unchanged too, so the same safety gate would license retrying it.
 
-## Open: fencing tokens go backwards and get reused under replica placement
+## Closed: fencing tokens go backwards and get reused under replica placement
+
+> **Status (Vorpal `01d4a5cf`): DONE, verified with the install path exercised, 2026-10-07.** Fixed in
+> kahuna `568463e` (drop node-local lock leases and key-value entries on snapshot install). The
+> earlier caveat — snapshot seeding never fired, so the repaired path was probably not exercised —
+> no longer holds: since kahuna `f582eca` (2026-08-18) every run imports whole-partition state.
+> `lock / partition,placement` from 2026-08-19 to 2026-10-07: 62 job-runs, **60 clean** with
+> `:fencing` and `:exclusion` valid and `:imported` 1–10 per run (275 imports, 27,742 acquires), 0
+> `:valid? false`, 2 cancelled before a verdict. The history below is unchanged.
 
 Filed as `01d4a5cf`. From run `32051818625`, `lock / partition,placement` at RF 3 — a
 **`:valid? false`**, not a vacuity refusal:
@@ -668,7 +728,19 @@ job is the only one with the placement fault and the only one at a replication f
 movement, because until kahuna `09c99a1` the placement controller moved nothing at all. This is the
 first run in which a lock partition's replica set changed underneath live lock traffic.
 
-## Open: write skew (`:G2-item`) under key-range routing — and it is not the split
+## Closed: write skew (`:G2-item`) under key-range routing — and it is not the split
+
+> **Status (Vorpal `fe248fe4`): DONE, re-verified on run count, 2026-10-07.** The first closure
+> (2026-08-18, four job-runs) was premature: this job produced `:G2-item` again on 2026-08-25 (run
+> `32809277996`, kahuna `91d07feb`, also `:incompatible-order` on keys 17 and 18 — **no root cause**,
+> artifact expired), 2026-09-18 and 2026-09-20. The two September cycles are Vorpal `cff7d0a5`: a
+> transaction committed across two leaders of one partition, and a follower that acked a snapshot
+> install it never imported. Both fixed 2026-09-20 (kahuna `83658b2`, Kommander 1.7.4). Since then:
+> 20 job-runs, **Elle valid on 20 of 20**, 18 consecutive fully green to 2026-10-05. At the observed
+> ~10 % rate, 20 clean runs by chance is about 12 % — the same bar as the 29-run closure below. The
+> one red run since the fix (2026-10-06) is the placement checker, not Elle: see "a split reuses a
+> spent partition id", a partition-map defect in Kommander, fixed in 1.10.3. The history below is
+> unchanged.
 
 Filed as `fe248fe4`. From run `32051818625`, `append / partition,placement,range` at RF 3: a
 textbook write skew, T1 appending 22 while reading 24 empty and T2 reading 22 empty while appending
