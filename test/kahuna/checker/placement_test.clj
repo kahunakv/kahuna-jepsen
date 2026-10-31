@@ -575,3 +575,81 @@
     (is (= :unknown (:valid? r)))
     (is (= :unmeasured (:cause r)))
     (is (= [:transfer :stalled-move] (:unmeasured r)))))
+
+;; ---------------------------------------------------------------------------
+;; A node outside the roster has no view
+;; ---------------------------------------------------------------------------
+
+(defn stale
+  "A node's table as a node *outside the roster* reports it. The sampler stamps
+  every table with the node's own roster role, and `NotMember` is the one that
+  marks a table nobody updates any more."
+  [node partitions]
+  (assoc (placement node partitions) :roster-role "NotMember" :roster-version 6))
+
+(defn sample-tables
+  "A placement sample op at `ms` built from whole tables: `tables` is
+  {node table-or-nil}. Like `sample-views`, but the caller builds each table,
+  so it can carry a roster stamp."
+  [ms tables]
+  [{:type :info :process :nemesis :f :placement-sample
+    :time (* 1000000 ms) :value nil}
+   {:type :info :process :nemesis :f :placement-sample
+    :time (* 1000000 (inc ms))
+    :value (into (sorted-map) (map (fn [n] [n (get tables n)])) nodes)}])
+
+;; Partition 1 after a merge took it off the map: a live node lists nothing.
+(def gone {})
+
+(defn- after-the-merge
+  "A settled sample in which the three live nodes list no partition 1 and n4
+  still shows the Learner at generation 2. `stamp` builds n4's table."
+  [stamp ms]
+  (sample-tables ms {"n1" (placement "n1" gone)
+                     "n2" (placement "n2" gone)
+                     "n3" (placement "n3" gone)
+                     "n4" (stamp "n4" moving)}))
+
+(deftest a-node-outside-the-roster-cannot-keep-a-move-open
+  ;; The 2026-10-30 nightly. n4 left the roster between the add and the
+  ;; promotion, so its table still shows the Learner at generation 2. The live
+  ;; nodes promoted the Learner, retired it, and then merged the partition
+  ;; away, so they list no partition 1 at all. The highest-generation rule
+  ;; alone would make n4's frozen table the freshest view -- it is the only one
+  ;; -- and call a finished move stalled for the whole window.
+  (let [r (check* base-test [(settle 0)
+                             (sample 0 steady)
+                             (sample 500 moved)
+                             (after-the-merge stale 1000)
+                             (after-the-merge stale 2000)
+                             (after-the-merge stale 3000)])]
+    (is (true? (:valid? r)))
+    (testing "the verdict says how often a table was set aside"
+      (is (= 3 (:non-member-views r))))))
+
+(deftest the-same-frozen-table-from-a-member-is-still-a-stall
+  ;; The twin. With no stamp, n4 is a member as far as the checker can tell,
+  ;; and a member that still lists a partition nobody else has is behind the
+  ;; committed map by the whole window. That is the lag the stall check
+  ;; measures, and it must keep measuring it -- a filter that dropped every
+  ;; lone view would blind the check to a planner that stops short.
+  (let [r (check* base-test [(settle 0)
+                             (sample 0 steady)
+                             (sample 500 moved)
+                             (after-the-merge placement 1000)
+                             (after-the-merge placement 2000)
+                             (after-the-merge placement 3000)])
+        v (first (filter #(= :stalled-move (:type %)) (:violations r)))]
+    (is (false? (:valid? r)))
+    (is (= "n4:8082" (:endpoint v)))
+    (is (= 0 (:non-member-views r)))))
+
+(deftest only-a-not-member-stamp-sets-a-table-aside
+  ;; An older history has no stamp; a node that answered the placement read but
+  ;; not the membership read has none either. Both must read as members: the
+  ;; stamp proves a node out, and its absence proves nothing.
+  (is (placement/member-view? {}))
+  (is (placement/member-view? {:roster-role "Voter"}))
+  (is (placement/member-view? {:roster-role "Learner"}))
+  (is (placement/member-view? {:roster-role "Leaving"}))
+  (is (not (placement/member-view? {:roster-role "NotMember"}))))

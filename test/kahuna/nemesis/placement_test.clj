@@ -200,3 +200,68 @@
     (is (nil? (:generator pkg)))
     (is (nil? (:final-generator pkg)))
     (is (nil? (:nemesis pkg)))))
+
+;; ---------------------------------------------------------------------------
+;; Settling a leave that answered Timeout
+;; ---------------------------------------------------------------------------
+;;
+;; The HTTP answer `Timeout` means the removal may still commit, and in this
+;; suite it often does. The nemesis re-reads the roster later and decides what
+;; the node now is; `settle-outcome` is that decision, isolated from the HTTP
+;; and SSH it is fed by. The two real cases it must tell apart are the
+;; 2026-10-30 nightly (n6: dropped by the roster, hosting nothing -- the leave
+;; finished late) and the 2026-10-27 nightly (n3: dropped by the roster while
+;; still leading six ranges -- evicted, Kommander a2233ad0).
+
+(def ^:private roster-with-n3
+  {:version 19 :members #{"n1:8082" "n2:8082" "n3:8082" "n4:8082"}})
+
+(def ^:private roster-without-n3
+  {:version 24 :members #{"n1:8082" "n2:8082" "n4:8082"}})
+
+(defn- table
+  "n3's own placement table, hosting `hosted` partitions."
+  [hosted]
+  {:endpoint "n3:8082"
+   :hosted-count hosted
+   :partitions (into {} (for [pid (range 1 (inc (max hosted 1)))]
+                          [pid {:hosted-locally (< (dec pid) hosted) :replicas []}]))})
+
+(deftest a-timed-out-leave-that-committed-late-is-settled-as-left
+  (is (= :left-late (placement/settle-outcome "n3" 18 roster-without-n3
+                                              {:role "NotMember"} (table 0)))))
+
+(deftest a-node-dropped-while-still-hosting-is-stranded-not-left
+  ;; Stopping it would hand its ranges a new leader and hide the defect.
+  (is (= :stranded (placement/settle-outcome "n3" 18 roster-without-n3
+                                             {:role "NotMember"} (table 6))))
+  (testing "the per-partition flag alone is enough"
+    (is (= :stranded (placement/settle-outcome
+                       "n3" 18 roster-without-n3 {:role "NotMember"}
+                       {:hosted-count 0
+                        :partitions {8 {:hosted-locally true :replicas []}}})))))
+
+(deftest a-leave-still-in-the-roster-stays-pending-unless-rolled-back
+  (is (= :pending (placement/settle-outcome "n3" 18 roster-with-n3 {:role "Leaving"} (table 6))))
+  (testing "the node's own role unreadable: still pending"
+    (is (= :pending (placement/settle-outcome "n3" 18 roster-with-n3 nil (table 6)))))
+  (testing "a Voter in a roster newer than the answer's: nothing is in flight"
+    (is (= :rolled-back (placement/settle-outcome "n3" 18 roster-with-n3 {:role "Voter"} (table 6))))))
+
+(deftest a-voter-at-the-answers-own-roster-version-proves-nothing
+  ;; 2026-10-30, n1: the Timeout answer carried version 6, and the Leaving
+  ;; commit landed 40 s later. For those 40 s every roster named n1 a Voter at
+  ;; version 6. Calling that rolled back would forget the node, and its late
+  ;; removal would then leave it running outside the roster, frozen table and
+  ;; all -- the exact shape this settlement exists to close.
+  (let [same-version (assoc roster-with-n3 :version 18)]
+    (is (= :pending (placement/settle-outcome "n3" 18 same-version {:role "Voter"} (table 6)))))
+  (testing "no version on the answer: never concluded rolled back"
+    (is (= :pending (placement/settle-outcome "n3" nil roster-with-n3 {:role "Voter"} (table 6))))))
+
+(deftest a-leave-nobody-can-judge-is-unknown
+  (testing "no member answered for the roster"
+    (is (= :unknown (placement/settle-outcome "n3" 18 nil {:role "NotMember"} (table 0)))))
+  (testing "out of the roster, but the node's own table is unreadable"
+    ;; A wrong :left-late is a kill wearing a leave's name, so this waits.
+    (is (= :unknown (placement/settle-outcome "n3" 18 roster-without-n3 nil nil)))))

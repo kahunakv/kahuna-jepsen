@@ -583,6 +583,34 @@
         (map (fn [node] [node (placement node)]))
         (:nodes test)))
 
+(defn placement-sample
+  "Every node's view of the placement table, each stamped with the node's own
+  committed roster role: {node → placement-or-nil}, where a placement carries
+  `:roster-role` (\"Voter\", \"Learner\", \"Leaving\" or \"NotMember\") and
+  `:roster-version` when the node answered /v1/cluster/membership as well.
+
+  The stamp is what lets a checker tell a lagging member from a node that is
+  no longer in the roster. A member that lags still receives the committed map
+  and catches up; a node the roster has dropped receives nothing, so its table
+  is frozen at the moment it left and stays that way for as long as the
+  process runs. A decommission whose HTTP call timed out and whose removal then
+  committed anyway leaves exactly such a node behind (the 2026-10-30 nightly),
+  and its frozen table was the only view of a partition the live cluster had
+  merged away. From the table alone the two cases look the same, and the stale
+  view read as a stalled move.
+
+  Two round trips per node. A node that answers neither contributes nil; a node
+  that answers only the placement read contributes an unstamped table, which
+  the checker treats as a member's."
+  [test]
+  (into (sorted-map)
+        (map (fn [node]
+               [node (when-let [p (placement node)]
+                       (if-let [m (membership node)]
+                         (assoc p :roster-role (:role m) :roster-version (:version m))
+                         p))]))
+        (:nodes test)))
+
 (defn ranges
   "The range-descriptor map as seen by `node`, or nil if it cannot answer. A
   thin pass-through to the client so the range nemesis and checker have one

@@ -89,7 +89,10 @@
     the table for a settle window, and a replica still Learner or Removing at
     the end of it, for longer than `stalled-move-bound` with no fault in the
     way, is a `:stalled-move` violation. See `stalled-moves` for how the window
-    is measured and why only the healed part of the run counts.
+    is measured and why only the healed part of the run counts. Only the
+    tables of nodes still in the roster are read: a node the roster has
+    dropped keeps a table frozen at the moment it left, and a frozen table is
+    not a view of the committed map — see `member-view?`.
 
   Not checked, on purpose:
 
@@ -115,18 +118,50 @@
 ;; Reading samples out of the history
 ;; ---------------------------------------------------------------------------
 
+(defn member-view?
+  "Does this node's table count as a view of the committed map?
+
+  Only while the node is in the roster. The sampler stamps each table with the
+  node's own roster role (`kdb/placement-sample`); a node that reports itself
+  `NotMember` receives no committed entries, so its table is frozen at the
+  moment it left and describes a map that no longer exists. A frozen table is
+  how the 2026-10-30 nightly went red: a node whose leave had timed out at the
+  HTTP layer, and then committed anyway, kept running, and its table was the
+  only one still listing a partition the live cluster had merged away — with a
+  Learner on it that had been promoted and retired thirteen minutes earlier.
+  The highest-generation rule in `freshest-views` cannot help there: the frozen
+  view was the only view.
+
+  A table with no stamp — an older history, or a node that answered the
+  placement read but not the membership read — is kept. The stamp is what
+  proves a node *out*, and its absence proves nothing."
+  [placement]
+  (not= "NotMember" (:roster-role placement)))
+
 (defn samples
   "The placement samples in `history`, oldest first, as
-  `{:time nanos :views {node placement-or-nil}}`.
+  `{:time nanos :views {node placement-or-nil} :ignored [node …]}`.
 
   A sampler op appears twice — invocation and completion both carry `:type
   :info` — and only the completion has a value, so filtering on a map value
-  keeps exactly one of each pair."
+  keeps exactly one of each pair.
+
+  A node that reports itself out of the roster contributes nil, exactly as an
+  unreachable node does, and is named in `:ignored` so the verdict can say how
+  often a table was set aside. See `member-view?` for why."
   [history]
   (->> (h/history history)
        (h/remove h/client-op?)
        (filter #(and (= :placement-sample (:f %)) (map? (:value %))))
-       (mapv (fn [op] {:time (:time op) :views (:value op)}))))
+       (mapv (fn [op]
+               (let [views   (:value op)
+                     ignored (vec (sort (keep (fn [[node p]]
+                                                (when (and (map? p) (not (member-view? p)))
+                                                  node))
+                                              views)))]
+                 {:time    (:time op)
+                  :views   (reduce #(assoc %1 %2 nil) views ignored)
+                  :ignored ignored})))))
 
 (defn settle-marker
   "When the final heal ended and the settle window began: the completion of the
@@ -395,7 +430,12 @@
   Nodes lag behind the committed map, and a lagging node still reports the
   replica it saw mid-move. Reading the stale view would call a move stalled
   for as long as one node was behind — the highest generation is the committed
-  truth as far as this sample can tell it."
+  truth as far as this sample can tell it.
+
+  This rule only works among nodes that still receive the map. A node out of
+  the roster never catches up, and once the live nodes drop a partition (a
+  merge) its frozen view is the only one left and so the highest. `samples`
+  sets those tables aside before they get here — see `member-view?`."
   [views]
   (reduce
     (fn [acc [_node placement]]
@@ -760,6 +800,12 @@
                            (not (:measured? stall)) (conj :stalled-move))
               base     {:replication-factor (kdb/replication-factor test)
                         :samples            (count ss)
+                        ;; Node-samples set aside because the node reported
+                        ;; itself out of the roster (`member-view?`). Non-zero
+                        ;; means a process kept running outside the cluster
+                        ;; for part of the run; the nemesis records who, as
+                        ;; :stranded or :settled on its ops.
+                        :non-member-views   (reduce + 0 (map (comp count :ignored) ss))
                         :evidence           ev
                         :evidence-required  (vec (sort required))
                         :movement           (dissoc move :transitions)

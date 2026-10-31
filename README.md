@@ -135,6 +135,17 @@ the bound, is a `:stalled-move` violation and fails the run:
                                          :duration-secs 58.0, :bound-secs 50.0}]}
 ```
 
+Only the tables of nodes still in the roster are read. The sampler stamps every
+table with the node's own roster role, and the checker sets a `NotMember` table
+aside (`:non-member-views` counts how often): a node the roster has dropped
+receives no committed map, so its table is frozen at the moment it left, and
+after a merge it can be the only table still listing a partition — with a
+Learner on it that finished long ago. A decommission whose HTTP call answered
+`Timeout` is re-read against the roster before the nemesis's next op; a node
+the roster dropped while it hosted nothing is stopped and wiped then, and one
+dropped while still hosting ranges is recorded as `:stranded` and left running,
+because stopping it would hide the stalled move it causes.
+
 Only the settled part of the run counts toward the bound. Mid-run a Learner may
 legitimately wait out a kill — at RF 1 the only copy to seed from is the voter
 the nemesis just stopped — so a move that was stuck behind a fault gets the

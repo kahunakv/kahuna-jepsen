@@ -264,6 +264,19 @@ move stuck behind a fault is given the whole bound after the heal before it is
 called stuck. A window shorter than the bound comes back `:unmeasured`, never
 clean.
 
+Only roster members have a view. Every sampled table carries the node's own
+roster role, and a `NotMember` table is set aside before any property reads it:
+a node the roster has dropped receives no committed map, its table freezes at
+the moment it left, and once the live nodes merge a partition away that frozen
+table is the only one still listing it. The 2026-10-30 nightly went red on
+exactly that — a Learner that had been promoted and retired thirteen minutes
+earlier, reported by a node whose leave had answered `Timeout` and then
+committed. The nemesis closes the other half of that gap: a `Timeout` leave is
+re-read against the roster before its next op, a node the roster dropped while
+hosting nothing is stopped and wiped (the leave's second half), and a node
+dropped while still hosting ranges is recorded as `:stranded` and left running,
+since it is the evicted range leader the stall check exists to catch.
+
 The safety properties it does assert are the ones Kommander states as
 invariants — single mover per range, one committed map everywhere at a given
 generation, at least one voter in a placed range, no replica on an unknown
