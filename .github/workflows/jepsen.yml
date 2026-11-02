@@ -476,6 +476,11 @@ jobs:
       # one value, so the two can never drift apart. The compose file defines
       # six; a job that names five leaves n6 unbuilt rather than idling.
       NODES:       ${{ matrix.nodes || 'n1,n2,n3,n4,n5' }}
+      # Pinned so the Leiningen jar cache below can be keyed on it. The lein
+      # script's `stable` branch moves the version on its own; a cached jar
+      # for the old version would then sit unused while every job went back
+      # to the network.
+      LEIN_VERSION: '2.12.0'
 
     steps:
       - name: Check out test suite
@@ -511,6 +516,19 @@ jobs:
           key: nuget-${{ hashFiles('kahuna/**/*.csproj') }}
           restore-keys: nuget-
 
+      - name: Cache Leiningen jar
+        # `lein` fetches its own standalone jar on first run, from a GitHub
+        # release that redirects to release-assets.githubusercontent.com.
+        # Every job used to do that fetch on every run, so one runner with a
+        # bad resolver turned the whole night red: on 2026-11-02 one job of
+        # 26 failed with `curl: (6) Could not resolve host` while its sibling
+        # had fetched the same jar 11 s earlier. With the jar cached, only the
+        # first run after a version bump touches the network.
+        uses: actions/cache@v5
+        with:
+          path: ~/.lein/self-installs
+          key: lein-${{ env.LEIN_VERSION }}
+
       - name: Install plotting tools
         # jepsen.checker/perf shells out to gnuplot; without it the perf
         # checker returns :valid? :unknown and drags the whole run's verdict
@@ -520,7 +538,7 @@ jobs:
       - name: Install Leiningen
         run: |
           sudo curl -fsSL -o /usr/local/bin/lein \
-            https://raw.githubusercontent.com/technomancy/leiningen/stable/bin/lein
+            https://raw.githubusercontent.com/technomancy/leiningen/${LEIN_VERSION}/bin/lein
           sudo chmod +x /usr/local/bin/lein
           lein version
 
